@@ -1,0 +1,877 @@
+     1→     1→'use client';
+     2→     2→
+     3→     3→import React, { useCallback, useEffect, useRef, useState } from 'react';
+     4→     4→import { Button } from '@/components/ui/button';
+     5→     5→import { Switch } from '@/components/ui/switch';
+     6→     6→import { ScrollArea } from '@/components/ui/scroll-area';
+     7→     7→import {
+     8→     8→  Upload,
+     9→     9→  Box,
+    10→    10→  Download,
+    11→    11→  RotateCcw,
+    12→    12→  AlertCircle,
+    13→    13→  CheckCircle2,
+    14→    14→  Info,
+    15→    15→  Loader2,
+    16→    16→  FileBox,
+    17→    17→  FlipVertical,
+    18→    18→} from 'lucide-react';
+    19→    19→
+    20→    20→/* ------------------------------------------------------------------ */
+    21→    21→/*  Types                                                              */
+    22→    22→/* ------------------------------------------------------------------ */
+    23→    23→
+    24→    24→interface LogEntry {
+    25→    25→  id: number;
+    26→    26→  text: string;
+    27→    27→  level: 'info' | 'error' | 'success';
+    28→    28→  ts: string;
+    29→    29→}
+    30→    30→
+    31→    31→interface TriResult {
+    32→    32→  triCount: number;
+    33→    33→  bytes: ArrayBuffer;
+    34→    34→}
+    35→    35→
+    36→    36→/* ------------------------------------------------------------------ */
+    37→    37→/*  Utility helpers                                                    */
+    38→    38→/* ------------------------------------------------------------------ */
+    39→    39→
+    40→    40→function sleep(ms: number) {
+    41→    41→  return new Promise((r) => setTimeout(r, ms));
+    42→    42→}
+    43→    43→
+    44→    44→async function waitFor<T>(
+    45→    45→  check: () => T | null,
+    46→    46→  timeoutMs: number,
+    47→    47→  label: string,
+    48→    48→): Promise<T> {
+    49→    49→  const start = Date.now();
+    50→    50→  while (Date.now() - start < timeoutMs) {
+    51→    51→    const v = check();
+    52→    52→    if (v) return v;
+    53→    53→    await sleep(150);
+    54→    54→  }
+    55→    55→  throw new Error(`Timed out waiting for ${label} (${timeoutMs}ms)`);
+    56→    56→}
+    57→    57→
+    58→    58→function safe<T>(fn: () => T): T | undefined {
+    59→    59→  try {
+    60→    60→    return fn();
+    61→    61→  } catch {
+    62→    62→    return undefined;
+    63→    63→  }
+    64→    64→}
+    65→    65→
+    66→    66→function looksLikeViewer(v: unknown): boolean {
+    67→    67→  if (!v || typeof v !== 'object') return false;
+    68→    68→  const m =
+    69→    69→    safe(() => (v as Record<string, unknown>).model) ??
+    70→    70→    safe(() =>
+    71→    71→      typeof (v as Record<string, unknown>).getModel === 'function'
+    72→    72→        ? (v as { getModel: () => unknown }).getModel()
+    73→    73→        : undefined,
+    74→    74→    );
+    75→    75→  return !!(m && typeof (m as Record<string, unknown>).getNodeChildren === 'function');
+    76→    76→}
+    77→    77→
+    78→    78→function findWebViewer(rootEl: HTMLElement): unknown {
+    79→    79→  const seen = new WeakSet();
+    80→    80→  function walkFiber(fiber: unknown, depth: number): unknown {
+    81→    81→    if (!fiber || depth > 200 || seen.has(fiber as object)) return null;
+    82→    82→    seen.add(fiber as object);
+    83→    83→    for (const key of [
+    84→    84→      'stateNode',
+    85→    85→      'memoizedState',
+    86→    86→      'memoizedProps',
+    87→    87→      'ref',
+    88→    88→    ] as const) {
+    89→    89→      const v = safe(() => (fiber as Record<string, unknown>)[key]);
+    90→    90→      if (looksLikeViewer(v)) return v;
+    91→    91→      if (v && typeof v === 'object') {
+    92→    92→        const cur = safe(() => (v as { current?: unknown }).current);
+    93→    93→        if (looksLikeViewer(cur)) return cur;
+    94→    94→        let h = v as Record<string, unknown>;
+    95→    95→        for (let i = 0; i < 80 && h; i++) {
+    96→    96→          if (looksLikeViewer(h)) return h;
+    97→    97→          const hc = safe(() => (h as { current?: unknown }).current);
+    98→    98→          if (looksLikeViewer(hc)) return hc;
+    99→    99→          for (const k of ['baseState', 'memoizedState'] as const) {
+   100→   100→            const inner = safe(() => (h as Record<string, unknown>)[k]);
+   101→   101→            if (looksLikeViewer(inner)) return inner;
+   102→   102→          }
+   103→   103→          h = safe(() => (h as { next?: unknown }).next) as Record<string, unknown>;
+   104→   104→        }
+   105→   105→      }
+   106→   106→    }
+   107→   107→    return (
+   108→   108→      walkFiber(safe(() => (fiber as { child?: unknown }).child), depth + 1) ??
+   109→   109→      walkFiber(safe(() => (fiber as { sibling?: unknown }).sibling), depth + 1)
+   110→   110→    );
+   111→   111→  }
+   112→   112→  const stack = [rootEl];
+   113→   113→  while (stack.length) {
+   114→   114→    const el = stack.pop()!;
+   115→   115→    const props = safe(() => Object.getOwnPropertyNames(el)) ?? [];
+   116→   116→    for (const p of props) {
+   117→   117→      if (!p.startsWith('__reactFiber') && !p.startsWith('__reactInternalInstance'))
+   118→   118→        continue;
+   119→   119→      const found = walkFiber(safe(() => (el as Record<string, unknown>)[p]), 0);
+   120→   120→      if (found) return found;
+   121→   121→    }
+   122→   122→    for (const c of Array.from(el.children)) stack.push(c);
+   123→   123→  }
+   124→   124→  return null;
+   125→   125→}
+   126→   126→
+   127→   127→function modelHasGeometry(model: Record<string, unknown>): boolean {
+   128→   128→  try {
+   129→   129→    const root =
+   130→   130→      typeof model.getAbsoluteRootNode === 'function'
+   131→   131→        ? (model.getAbsoluteRootNode as () => unknown)()
+   132→   132→        : typeof model.getRootNode === 'function'
+   133→   133→          ? (model.getRootNode as () => unknown)()
+   134→   134→          : null;
+   135→   135→    const kids =
+   136→   136→      typeof model.getNodeChildren === 'function'
+   137→   137→        ? (model.getNodeChildren as (n: unknown) => unknown[])(root)
+   138→   138→        : [];
+   139→   139→    return Array.isArray(kids) && kids.length > 0;
+   140→   140→  } catch {
+   141→   141→    return false;
+   142→   142→  }
+   143→   143→}
+   144→   144→
+   145→   145→async function buildStl(
+   146→   146→  model: Record<string, unknown>,
+   147→   147→  flipZ: boolean,
+   148→   148→): Promise<TriResult> {
+   149→   149→  const root =
+   150→   150→    typeof model.getAbsoluteRootNode === 'function'
+   151→   151→      ? (model.getAbsoluteRootNode as () => unknown)()
+   152→   152→      : (model.getRootNode as () => unknown)();
+   153→   153→
+   154→   154→  // Walk ALL nodes recursively
+   155→   155→  const nodes: unknown[] = [];
+   156→   156→  (function walk(id: unknown) {
+   157→   157→    nodes.push(id);
+   158→   158→    for (const c of (
+   159→   159→      model.getNodeChildren as (n: unknown) => unknown[]
+   160→   160→    )(id) || [])
+   161→   161→      walk(c);
+   162→   162→  })(root);
+   163→   163→
+   164→   164→  const transform = (m: number[], x: number, y: number, z: number): number[] => {
+   165→   165→    const o = [
+   166→   166→      m[0] * x + m[4] * y + m[8] * z + m[12],
+   167→   167→      m[1] * x + m[5] * y + m[9] * z + m[13],
+   168→   168→      m[2] * x + m[6] * y + m[10] * z + m[14],
+   169→   169→    ];
+   170→   170→    if (flipZ) o[2] = -o[2];
+   171→   171→    return o;
+   172→   172→  };
+   173→   173→
+   174→   174→  const transformDir = (
+   175→   175→    m: number[],
+   176→   176→    x: number,
+   177→   177→    y: number,
+   178→   178→    z: number,
+   179→   179→  ): number[] => {
+   180→   180→    const o = [
+   181→   181→      m[0] * x + m[4] * y + m[8] * z,
+   182→   182→      m[1] * x + m[5] * y + m[9] * z,
+   183→   183→      m[2] * x + m[6] * y + m[10] * z,
+   184→   184→    ];
+   185→   185→    if (flipZ) o[2] = -o[2];
+   186→   186→    return o;
+   187→   187→  };
+   188→   188→
+   189→   189→  const tris: number[][] = [];
+   190→   190→  let triCount = 0;
+   191→   191→  let skipped = 0;
+   192→   192→
+   193→   193→  for (const id of nodes) {
+   194→   194→    let mesh: Record<string, unknown> | null = null;
+   195→   195→    try {
+   196→   196→      mesh = (await (
+   197→   197→        model.getNodeMeshData as (id: unknown) => Promise<Record<string, unknown>>
+   198→   198→      )(id)) as Record<string, unknown> | null;
+   199→   199→    } catch {
+   200→   200→      skipped++;
+   201→   201→      continue;
+   202→   202→    }
+   203→   203→    if (!mesh) continue;
+   204→   204→    const faces = mesh.faces as
+   205→   205→      | (Iterable<{ position: number[]; normal?: number[] }> & {
+   206→   206→          vertexCount?: number;
+   207→   207→        })
+   208→   208→      | undefined;
+   209→   209→    if (!faces || !faces[Symbol.iterator] || !faces.vertexCount) continue;
+   210→   210→
+   211→   211→    let matObj: unknown = null;
+   212→   212→    try {
+   213→   213→      if (typeof model.getNodeNetMatrix === 'function')
+   214→   214→        matObj = (model.getNodeNetMatrix as (id: unknown) => unknown)(id);
+   215→   215→      else if (typeof model.getNetMatrix === 'function')
+   216→   216→        matObj = (model.getNetMatrix as (id: unknown) => unknown)(id);
+   217→   217→      if (matObj && typeof (matObj as Promise<unknown>).then === 'function')
+   218→   218→        matObj = await matObj;
+   219→   219→    } catch {
+   220→   220→      matObj = null;
+   221→   221→    }
+   222→   222→
+   223→   223→    let m: number[];
+   224→   224→    if (Array.isArray(matObj) && matObj.length === 16) m = matObj;
+   225→   225→    else if (
+   226→   226→      matObj &&
+   227→   227→      Array.isArray((matObj as { m?: number[] }).m) &&
+   228→   228→      (matObj as { m?: number[] }).m!.length === 16
+   229→   229→    )
+   230→   230→      m = (matObj as { m: number[] }).m;
+   231→   231→    else if (
+   232→   232→      matObj &&
+   233→   233→      typeof (matObj as { getElements?: () => number[] }).getElements ===
+   234→   234→        'function'
+   235→   235→    )
+   236→   236→      m = (matObj as { getElements: () => number[] }).getElements();
+   237→   237→    else m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+   238→   238→
+   239→   239→    const buf: { p: number[]; n: number[] | null }[] = [];
+   240→   240→    for (const v of faces) {
+   241→   241→      buf.push({
+   242→   242→        p: [v.position[0], v.position[1], v.position[2]],
+   243→   243→        n: v.normal
+   244→   244→          ? [v.normal[0], v.normal[1], v.normal[2]]
+   245→   245→          : null,
+   246→   246→      });
+   247→   247→      if (buf.length === 3) {
+   248→   248→        const [a, b, c] = buf;
+   249→   249→        const p0 = transform(m, a.p[0], a.p[1], a.p[2]);
+   250→   250→        const p1 = transform(m, b.p[0], b.p[1], b.p[2]);
+   251→   251→        const p2 = transform(m, c.p[0], c.p[1], c.p[2]);
+   252→   252→        const n = a.n
+   253→   253→          ? transformDir(m, a.n[0], a.n[1], a.n[2])
+   254→   254→          : [0, 0, 0];
+   255→   255→        if (flipZ) {
+   256→   256→          tris.push([
+   257→   257→            n[0], n[1], n[2],
+   258→   258→            p0[0], p0[1], p0[2],
+   259→   259→            p2[0], p2[1], p2[2],
+   260→   260→            p1[0], p1[1], p1[2],
+   261→   261→          ]);
+   262→   262→        } else {
+   263→   263→          tris.push([
+   264→   264→            n[0], n[1], n[2],
+   265→   265→            p0[0], p0[1], p0[2],
+   266→   266→            p1[0], p1[1], p1[2],
+   267→   267→            p2[0], p2[1], p2[2],
+   268→   268→          ]);
+   269→   269→        }
+   270→   270→        triCount++;
+   271→   271→        buf.length = 0;
+   272→   272→      }
+   273→   273→    }
+   274→   274→  }
+   275→   275→
+   276→   276→  if (skipped) console.log(`Skipped ${skipped} nodes with errors`);
+   277→   277→  if (!triCount)
+   278→   278→    throw new Error(
+   279→   279→      'No triangles collected \u2014 model may not have streamed yet',
+   280→   280→    );
+   281→   281→
+   282→   282→  // Build binary STL
+   283→   283→  const buffer = new ArrayBuffer(84 + triCount * 50);
+   284→   284→  const dv = new DataView(buffer);
+   285→   285→  dv.setUint32(80, triCount, true);
+   286→   286→  let off = 84;
+   287→   287→  for (const t of tris) {
+   288→   288→    for (let i = 0; i < 12; i++) {
+   289→   289→      dv.setFloat32(off, t[i], true);
+   290→   290→      off += 4;
+   291→   291→    }
+   292→   292→    dv.setUint16(off, 0, true);
+   293→   293→    off += 2;
+   294→   294→  }
+   295→   295→  return { triCount, bytes: buffer };
+   296→   296→}
+   297→   297→
+   298→   298→/* ------------------------------------------------------------------ */
+   299→   299→/*  Format helpers                                                     */
+   300→   300→/* ------------------------------------------------------------------ */
+   301→   301→
+   302→   302→function formatBytes(b: number): string {
+   303→   303→  if (b < 1024) return `${b} B`;
+   304→   304→  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+   305→   305→  return `${(b / 1048576).toFixed(1)} MB`;
+   306→   306→}
+   307→   307→
+   308→   308→function ts(): string {
+   309→   309→  return new Date().toLocaleTimeString([], {
+   310→   310→    hour: '2-digit',
+   311→   311→    minute: '2-digit',
+   312→   312→    second: '2-digit',
+   313→   313→  });
+   314→   314→}
+   315→   315→
+   316→   316→/* ------------------------------------------------------------------ */
+   317→   317→/*  Main Component                                                     */
+   318→   318→/* ------------------------------------------------------------------ */
+   319→   319→
+   320→   320→export default function ScsToStlPage() {
+   321→   321→  // State
+   322→   322→  const [file, setFile] = useState<File | null>(null);
+   323→   323→  const [flipZ, setFlipZ] = useState(true);
+   324→   324→  const [converting, setConverting] = useState(false);
+   325→   325→  const [stlResult, setStlResult] = useState<TriResult | null>(null);
+   326→   326→  const [logs, setLogs] = useState<LogEntry[]>([]);
+   327→   327→  const [hoopsReady, setHoopsReady] = useState(false);
+   328→   328→  const [viewerMounted, setViewerMounted] = useState(false);
+   329→   329→  const [dragOver, setDragOver] = useState(false);
+   330→   330→
+   331→   331→  // Refs — fileRef avoids stale closures; modelRef persists across renders
+   332→   332→  const fileRef = useRef<File | null>(null);
+   333→   333→  const modelRef = useRef<Record<string, unknown> | null>(null);
+   334→   334→  const viewerContainerRef = useRef<HTMLDivElement>(null);
+   335→   335→  const blobUrlRef = useRef<string>('');
+   336→   336→  const logIdRef = useRef(0);
+   337→   337→  const fileInputRef = useRef<HTMLInputElement>(null);
+   338→   338→  const stlUrlRef = useRef<string>('');
+   339→   339→
+   340→   340→  // Keep fileRef in sync with file state
+   341→   341→  useEffect(() => {
+   342→   342→    fileRef.current = file;
+   343→   343→  }, [file]);
+   344→   344→
+   345→   345→  /* ---------- Logging ---------- */
+   346→   346→  const addLog = useCallback(
+   347→   347→    (text: string, level: LogEntry['level'] = 'info') => {
+   348→   348→      setLogs((prev) => [
+   349→   349→        ...prev,
+   350→   350→        { id: ++logIdRef.current, text, level, ts: ts() },
+   351→   351→      ]);
+   352→   352→    },
+   353→   353→    [],
+   354→   354→  );
+   355→   355→
+   356→   356→  /* ---------- Load HOOPS bundle ---------- */
+   357→   357→  useEffect(() => {
+   358→   358→    if (document.getElementById('hoops-bundle')) {
+   359→   359→      // Script tag already exists; check if loaded
+   360→   360→      const check = () => {
+   361→   361→        if ((window as Record<string, unknown>).GcHoopsViewer) {
+   362→   362→          setHoopsReady(true);
+   363→   363→          addLog('HOOPS engine ready.', 'success');
+   364→   364→        }
+   365→   365→      };
+   366→   366→      check();
+   367→   367→      return;
+   368→   368→    }
+   369→   369→    addLog('Loading HOOPS Communicator engine...');
+   370→   370→    const script = document.createElement('script');
+   371→   371→    script.id = 'hoops-bundle';
+   372→   372→    script.src = '/hoops/bundle.js';
+   373→   373→    script.async = true;
+   374→   374→    script.onload = () => {
+   375→   375→      // Give the bundle a tick to initialise
+   376→   376→      const poll = setInterval(() => {
+   377→   377→        if ((window as Record<string, unknown>).GcHoopsViewer) {
+   378→   378→          clearInterval(poll);
+   379→   379→          setHoopsReady(true);
+   380→   380→          addLog('HOOPS engine ready.', 'success');
+   381→   381→        }
+   382→   382→      }, 200);
+   383→   383→      // Timeout after 30 s
+   384→   384→      setTimeout(() => clearInterval(poll), 30_000);
+   385→   385→    };
+   386→   386→    script.onerror = () => addLog('Failed to load HOOPS bundle.', 'error');
+   387→   387→    document.head.appendChild(script);
+   388→   388→  }, [addLog]);
+   389→   389→
+   390→   390→  /* ---------- mountAndWait ---------- */
+   391→   391→  const mountAndWait = useCallback(
+   392→   392→    async (fileToMount: File): Promise<Record<string, unknown>> => {
+   393→   393→      const GcHoopsViewer = (window as Record<string, unknown>)
+   394→   394→        .GcHoopsViewer as Record<string, unknown> | undefined;
+   395→   395→      if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== 'function') {
+   396→   396→        throw new Error(
+   397→   397→          'HOOPS Viewer engine is still loading. Please wait a moment and try again.',
+   398→   398→        );
+   399→   399→      }
+   400→   400→
+   401→   401→      // Create a FRESH div for HOOPS each time (prevents React conflict)
+   402→   402→      if (viewerContainerRef.current) {
+   403→   403→        while (viewerContainerRef.current.firstChild) {
+   404→   404→          viewerContainerRef.current.removeChild(
+   405→   405→            viewerContainerRef.current.firstChild,
+   406→   406→          );
+   407→   407→        }
+   408→   408→      }
+   409→   409→      const freshDiv = document.createElement('div');
+   410→   410→      freshDiv.style.width = '100%';
+   411→   411→      freshDiv.style.height = '100%';
+   412→   412→      freshDiv.style.minHeight = '400px';
+   413→   413→      viewerContainerRef.current?.appendChild(freshDiv);
+   414→   414→
+   415→   415→      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+   416→   416→      blobUrlRef.current = URL.createObjectURL(fileToMount);
+   417→   417→
+   418→   418→      addLog('Mounting 3D viewer...');
+   419→   419→      (GcHoopsViewer.mountViewer as (
+   420→   420→        el: HTMLElement,
+   421→   421→        opts: Record<string, unknown>,
+   422→   422→      ) => void)(freshDiv, {
+   423→   423→        file: blobUrlRef.current,
+   424→   424→        onAction: () => {},
+   425→   425→        onError: (e: unknown) => addLog(`Viewer error: ${e}`, 'error'),
+   426→   426→      });
+   427→   427→
+   428→   428→      addLog('Waiting for WebViewer...');
+   429→   429→      const hwv = await waitFor(
+   430→   430→        () =>
+   431→   431→          findWebViewer(freshDiv) as Record<string, unknown> | null,
+   432→   432→        30000,
+   433→   433→        'WebViewer instance',
+   434→   434→      );
+   435→   435→      addLog('WebViewer found.', 'success');
+   436→   436→
+   437→   437→      const model =
+   438→   438→        typeof (hwv as Record<string, unknown>).getModel === 'function'
+   439→   439→          ? (
+   440→   440→              hwv as { getModel: () => unknown }
+   441→   441→            ).getModel() as Record<string, unknown>
+   442→   442→          : (hwv as Record<string, unknown>).model;
+   443→   443→      if (!model || typeof model.getNodeChildren !== 'function') {
+   444→   444→        throw new Error('Model surface unrecognized');
+   445→   445→      }
+   446→   446→
+   447→   447→      addLog('Streaming geometry...');
+   448→   448→      await waitFor(
+   449→   449→        () => (modelHasGeometry(model) ? true : null),
+   450→   450→        60000,
+   451→   451→        'model geometry',
+   452→   452→      );
+   453→   453→      addLog('Geometry streamed.', 'success');
+   454→   454→      return model;
+   455→   455→    },
+   456→   456→    [addLog],
+   457→   457→  );
+   458→   458→
+   459→   459→  /* ---------- Handle file selection ---------- */
+   460→   460→  const handleFile = useCallback(
+   461→   461→    async (f: File) => {
+   462→   462→      if (!f.name.toLowerCase().endsWith('.scs')) {
+   463→   463→        addLog('Please select an .scs file.', 'error');
+   464→   464→        return;
+   465→   465→      }
+   466→   466→      setFile(f);
+   467→   467→      setStlResult(null);
+   468→   468→      if (stlUrlRef.current) {
+   469→   469→        URL.revokeObjectURL(stlUrlRef.current);
+   470→   470→        stlUrlRef.current = '';
+   471→   471→      }
+   472→   472→      addLog(`File selected: ${f.name} (${formatBytes(f.size)})`);
+   473→   473→
+   474→   474→      try {
+   475→   475→        setViewerMounted(false);
+   476→   476→        const model = await mountAndWait(f);
+   477→   477→        modelRef.current = model;
+   478→   478→        setViewerMounted(true);
+   479→   479→      } catch (err) {
+   480→   480→        addLog(
+   481→   481→          `Mount failed: ${err instanceof Error ? err.message : String(err)}`,
+   482→   482→          'error',
+   483→   483→        );
+   484→   484→      }
+   485→   485→    },
+   486→   486→    [addLog, mountAndWait],
+   487→   487→  );
+   488→   488→
+   489→   489→  /* ---------- Convert ---------- */
+   490→   490→  const handleConvert = useCallback(async () => {
+   491→   491→    const currentFile = fileRef.current;
+   492→   492→    if (!currentFile) return;
+   493→   493→    if (!modelRef.current) {
+   494→   494→      addLog('No model loaded. Please load a file first.', 'error');
+   495→   495→      return;
+   496→   496→    }
+   497→   497→    setConverting(true);
+   498→   498→    setStlResult(null);
+   499→   499→    addLog('Starting conversion...');
+   500→   500→
+   501→   501→    try {
+   502→   502→      const result = await buildStl(modelRef.current, flipZ);
+   503→   503→      setStlResult(result);
+   504→   504→      if (stlUrlRef.current) URL.revokeObjectURL(stlUrlRef.current);
+   505→   505→      stlUrlRef.current = URL.createObjectURL(
+   506→   506→        new Blob([result.bytes], { type: 'application/octet-stream' }),
+   507→   507→      );
+   508→   508→      addLog(
+   509→   509→        `Conversion done! ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
+   510→   510→        'success',
+   511→   511→      );
+   512→   512→    } catch (err) {
+   513→   513→      addLog(
+   514→   514→        `Conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+   515→   515→        'error',
+   516→   516→      );
+   517→   517→    } finally {
+   518→   518→      setConverting(false);
+   519→   519→    }
+   520→   520→  }, [flipZ, addLog]);
+   521→   521→
+   522→   522→  /* ---------- Download ---------- */
+   523→   523→  const handleDownload = useCallback(() => {
+   524→   524→    if (!stlResult || !stlUrlRef.current || !fileRef.current) return;
+   525→   525→    const a = document.createElement('a');
+   526→   526→    a.href = stlUrlRef.current;
+   527→   527→    a.download = fileRef.current.name.replace(/\.scs$/i, '.stl');
+   528→   528→    document.body.appendChild(a);
+   529→   529→    a.click();
+   530→   530→    document.body.removeChild(a);
+   531→   531→    addLog('STL file downloaded.', 'success');
+   532→   532→  }, [stlResult, addLog]);
+   533→   533→
+   534→   534→  /* ---------- Reset ---------- */
+   535→   535→  const handleReset = useCallback(() => {
+   536→   536→    setFile(null);
+   537→   537→    fileRef.current = null;
+   538→   538→    setStlResult(null);
+   539→   539→    setViewerMounted(false);
+   540→   540→    modelRef.current = null;
+   541→   541→    if (blobUrlRef.current) {
+   542→   542→      URL.revokeObjectURL(blobUrlRef.current);
+   543→   543→      blobUrlRef.current = '';
+   544→   544→    }
+   545→   545→    if (stlUrlRef.current) {
+   546→   546→      URL.revokeObjectURL(stlUrlRef.current);
+   547→   547→      stlUrlRef.current = '';
+   548→   548→    }
+   549→   549→    if (viewerContainerRef.current) {
+   550→   550→      while (viewerContainerRef.current.firstChild) {
+   551→   551→        viewerContainerRef.current.removeChild(
+   552→   552→          viewerContainerRef.current.firstChild,
+   553→   553→        );
+   554→   554→      }
+   555→   555→    }
+   556→   556→    setLogs([]);
+   557→   557→    logIdRef.current = 0;
+   558→   558→    addLog('Reset complete.');
+   559→   559→  }, [addLog]);
+   560→   560→
+   561→   561→  /* ---------- Drag & Drop ---------- */
+   562→   562→  const onDragOver = useCallback((e: React.DragEvent) => {
+   563→   563→    e.preventDefault();
+   564→   564→    e.stopPropagation();
+   565→   565→    setDragOver(true);
+   566→   566→  }, []);
+   567→   567→
+   568→   568→  const onDragLeave = useCallback((e: React.DragEvent) => {
+   569→   569→    e.preventDefault();
+   570→   570→    e.stopPropagation();
+   571→   571→    setDragOver(false);
+   572→   572→  }, []);
+   573→   573→
+   574→   574→  const onDrop = useCallback(
+   575→   575→    (e: React.DragEvent) => {
+   576→   576→      e.preventDefault();
+   577→   577→      e.stopPropagation();
+   578→   578→      setDragOver(false);
+   579→   579→      const f = e.dataTransfer.files?.[0];
+   580→   580→      if (f) handleFile(f);
+   581→   581→    },
+   582→   582→    [handleFile],
+   583→   583→  );
+   584→   584→
+   585→   585→  /* ---------- Auto-scroll log ---------- */
+   586→   586→  const logEndRef = useRef<HTMLDivElement>(null);
+   587→   587→  useEffect(() => {
+   588→   588→    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+   589→   589→  }, [logs]);
+   590→   590→
+   591→   591→  /* ---------- Render ---------- */
+   592→   592→  return (
+   593→   593→    <div className="dark min-h-screen flex flex-col bg-[#0a0f1a] text-gray-100">
+   594→   594→      {/* ──── Header ──── */}
+   595→   595→      <header className="border-b border-emerald-900/40 bg-[#0d1422]/80 backdrop-blur-sm sticky top-0 z-50">
+   596→   596→        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center gap-3">
+   597→   597→          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 shadow-lg shadow-emerald-500/20">
+   598→   598→            <Box className="w-5 h-5 text-white" />
+   599→   599→          </div>
+   600→   600→          <div>
+   601→   601→            <h1 className="text-lg font-bold tracking-tight">
+   602→   602→              <span className="text-emerald-400">SCS</span>
+   603→   603→              <span className="mx-1.5 text-gray-500">&rarr;</span>
+   604→   604→              <span className="text-teal-300">STL</span>
+   605→   605→              <span className="text-gray-400 font-normal ml-2 text-sm">
+   606→   606→                Converter
+   607→   607→              </span>
+   608→   608→            </h1>
+   609→   609→          </div>
+   610→   610→          <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+   611→   611→            {!hoopsReady && (
+   612→   612→              <span className="flex items-center gap-1.5 text-amber-400">
+   613→   613→                <Loader2 className="w-3 h-3 animate-spin" />
+   614→   614→                Loading engine...
+   615→   615→              </span>
+   616→   616→            )}
+   617→   617→            {hoopsReady && (
+   618→   618→              <span className="flex items-center gap-1.5 text-emerald-400">
+   619→   619→                <CheckCircle2 className="w-3 h-3" />
+   620→   620→                Engine ready
+   621→   621→              </span>
+   622→   622→            )}
+   623→   623→          </div>
+   624→   624→        </div>
+   625→   625→      </header>
+   626→   626→
+   627→   627→      {/* ──── Main ──── */}
+   628→   628→      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+   629→   629→        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 h-full">
+   630→   630→          {/* ── Left Panel ── */}
+   631→   631→          <div className="lg:col-span-2 flex flex-col gap-4">
+   632→   632→            {/* Upload Zone */}
+   633→   633→            <div
+   634→   634→              onDragOver={onDragOver}
+   635→   635→              onDragLeave={onDragLeave}
+   636→   636→              onDrop={onDrop}
+   637→   637→              onClick={() => fileInputRef.current?.click()}
+   638→   638→              className={`
+   639→   639→                relative cursor-pointer rounded-xl border-2 border-dashed
+   640→   640→                transition-all duration-200 p-6 text-center
+   641→   641→                ${
+   642→   642→                  dragOver
+   643→   643→                    ? 'border-emerald-400 bg-emerald-500/10 scale-[1.01]'
+   644→   644→                    : file
+   645→   645→                      ? 'border-emerald-700/50 bg-emerald-950/20'
+   646→   646→                      : 'border-gray-700 bg-gray-900/40 hover:border-emerald-600/60 hover:bg-gray-900/60'
+   647→   647→                }
+   648→   648→              `}
+   649→   649→            >
+   650→   650→              <input
+   651→   651→                ref={fileInputRef}
+   652→   652→                type="file"
+   653→   653→                accept=".scs"
+   654→   654→                className="hidden"
+   655→   655→                onChange={(e) => {
+   656→   656→                  const f = e.target.files?.[0];
+   657→   657→                  if (f) handleFile(f);
+   658→   658→                }}
+   659→   659→              />
+   660→   660→              {!file ? (
+   661→   661→                <div className="flex flex-col items-center gap-3">
+   662→   662→                  <div className="w-14 h-14 rounded-full bg-emerald-900/40 flex items-center justify-center">
+   663→   663→                    <Upload className="w-7 h-7 text-emerald-400" />
+   664→   664→                  </div>
+   665→   665→                  <div>
+   666→   666→                    <p className="font-medium text-gray-200">
+   667→   667→                      Drop your .scs file here
+   668→   668→                    </p>
+   669→   669→                    <p className="text-sm text-gray-500 mt-1">
+   670→   670→                      or click to browse
+   671→   671→                    </p>
+   672→   672→                  </div>
+   673→   673→                </div>
+   674→   674→              ) : (
+   675→   675→                <div className="flex flex-col items-center gap-2">
+   676→   676→                  <div className="w-12 h-12 rounded-full bg-emerald-900/40 flex items-center justify-center">
+   677→   677→                    <FileBox className="w-6 h-6 text-emerald-400" />
+   678→   678→                  </div>
+   679→   679→                  <p className="font-semibold text-emerald-300 truncate max-w-full">
+   680→   680→                    {file.name}
+   681→   681→                  </p>
+   682→   682→                  <p className="text-sm text-gray-400">
+   683→   683→                    {formatBytes(file.size)}
+   684→   684→                  </p>
+   685→   685→                </div>
+   686→   686→              )}
+   687→   687→            </div>
+   688→   688→
+   689→   689→            {/* Settings Card */}
+   690→   690→            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 p-4 space-y-4">
+   691→   691→              <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+   692→   692→                Settings
+   693→   693→              </h2>
+   694→   694→
+   695→   695→              {/* Flip Z Toggle */}
+   696→   696→              <div className="flex items-center justify-between">
+   697→   697→                <div className="flex items-center gap-2.5">
+   698→   698→                  <FlipVertical className="w-4 h-4 text-teal-400" />
+   699→   699→                  <div>
+   700→   700→                    <p className="text-sm font-medium text-gray-200">
+   701→   701→                      Flip Z-Axis
+   702→   702→                    </p>
+   703→   703→                    <p className="text-xs text-gray-500">
+   704→   704→                      For slicer compatibility
+   705→   705→                    </p>
+   706→   706→                  </div>
+   707→   707→                </div>
+   708→   708→                <Switch
+   709→   709→                  checked={flipZ}
+   710→   710→                  onCheckedChange={setFlipZ}
+   711→   711→                  className="data-[state=checked]:bg-emerald-600"
+   712→   712→                />
+   713→   713→              </div>
+   714→   714→            </div>
+   715→   715→
+   716→   716→            {/* Actions Card */}
+   717→   717→            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 p-4 space-y-3">
+   718→   718→              <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+   719→   719→                Actions
+   720→   720→              </h2>
+   721→   721→              <div className="grid grid-cols-1 gap-2.5">
+   722→   722→                <Button
+   723→   723→                  onClick={handleConvert}
+   724→   724→                  disabled={!viewerMounted || converting}
+   725→   725→                  className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-lg shadow-emerald-500/20 disabled:opacity-50 disabled:shadow-none"
+   726→   726→                >
+   727→   727→                  {converting ? (
+   728→   728→                    <>
+   729→   729→                      <Loader2 className="w-4 h-4 animate-spin" />
+   730→   730→                      Converting...
+   731→   731→                    </>
+   732→   732→                  ) : (
+   733→   733→                    <>
+   734→   734→                      <Box className="w-4 h-4" />
+   735→   735→                      Convert to STL
+   736→   736→                    </>
+   737→   737→                  )}
+   738→   738→                </Button>
+   739→   739→
+   740→   740→                <Button
+   741→   741→                  onClick={handleDownload}
+   742→   742→                  disabled={!stlResult}
+   743→   743→                  variant="outline"
+   744→   744→                  className="w-full border-emerald-700/50 text-emerald-300 hover:bg-emerald-950/40 hover:text-emerald-200 disabled:opacity-40"
+   745→   745→                >
+   746→   746→                  <Download className="w-4 h-4" />
+   747→   747→                  Download STL
+   748→   748→                  {stlResult && (
+   749→   749→                    <span className="text-xs text-gray-500 ml-1">
+   750→   750→                      ({formatBytes(stlResult.bytes.byteLength)})
+   751→   751→                    </span>
+   752→   752→                  )}
+   753→   753→                </Button>
+   754→   754→
+   755→   755→                <Button
+   756→   756→                  onClick={handleReset}
+   757→   757→                  variant="ghost"
+   758→   758→                  className="w-full text-gray-400 hover:text-gray-200 hover:bg-gray-800/60"
+   759→   759→                >
+   760→   760→                  <RotateCcw className="w-4 h-4" />
+   761→   761→                  Reset
+   762→   762→                </Button>
+   763→   763→              </div>
+   764→   764→
+   765→   765→              {stlResult && (
+   766→   766→                <div className="mt-2 rounded-lg bg-emerald-950/30 border border-emerald-800/30 p-3">
+   767→   767→                  <div className="flex items-center gap-2 text-emerald-400 text-sm font-medium">
+   768→   768→                    <CheckCircle2 className="w-4 h-4" />
+   769→   769→                    Conversion Complete
+   770→   770→                  </div>
+   771→   771→                  <p className="text-xs text-gray-400 mt-1">
+   772→   772→                    {stlResult.triCount.toLocaleString()} triangles &middot;{' '}
+   773→   773→                    {formatBytes(stlResult.bytes.byteLength)}
+   774→   774→                  </p>
+   775→   775→                </div>
+   776→   776→              )}
+   777→   777→            </div>
+   778→   778→
+   779→   779→            {/* Log Panel */}
+   780→   780→            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 flex flex-col overflow-hidden flex-1 min-h-[200px]">
+   781→   781→              <div className="px-4 py-2.5 border-b border-gray-800 flex items-center gap-2">
+   782→   782→                <Info className="w-3.5 h-3.5 text-gray-500" />
+   783→   783→                <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+   784→   784→                  Log
+   785→   785→                </h2>
+   786→   786→              </div>
+   787→   787→              <ScrollArea className="flex-1 max-h-64">
+   788→   788→                <div className="p-3 space-y-1 font-mono text-xs">
+   789→   789→                  {logs.length === 0 && (
+   790→   790→                    <p className="text-gray-600 italic">
+   791→   791→                      Waiting for activity...
+   792→   792→                    </p>
+   793→   793→                  )}
+   794→   794→                  {logs.map((l) => (
+   795→   795→                    <div
+   796→   796→                      key={l.id}
+   797→   797→                      className={`flex gap-2 ${
+   798→   798→                        l.level === 'error'
+   799→   799→                          ? 'text-red-400'
+   800→   800→                          : l.level === 'success'
+   801→   801→                            ? 'text-emerald-400'
+   802→   802→                            : 'text-gray-400'
+   803→   803→                      }`}
+   804→   804→                    >
+   805→   805→                      <span className="text-gray-600 shrink-0">{l.ts}</span>
+   806→   806→                      <span className="shrink-0">
+   807→   807→                        {l.level === 'error' ? (
+   808→   808→                          <AlertCircle className="w-3 h-3 inline" />
+   809→   809→                        ) : l.level === 'success' ? (
+   810→   810→                          <CheckCircle2 className="w-3 h-3 inline" />
+   811→   811→                        ) : (
+   812→   812→                          <Info className="w-3 h-3 inline" />
+   813→   813→                        )}
+   814→   814→                      </span>
+   815→   815→                      <span className="break-all">{l.text}</span>
+   816→   816→                    </div>
+   817→   817→                  ))}
+   818→   818→                  <div ref={logEndRef} />
+   819→   819→                </div>
+   820→   820→              </ScrollArea>
+   821→   821→            </div>
+   822→   822→          </div>
+   823→   823→
+   824→   824→          {/* ── Right Panel — 3D Viewer ── */}
+   825→   825→          <div className="lg:col-span-3 flex flex-col">
+   826→   826→            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 flex-1 flex flex-col overflow-hidden min-h-[400px]">
+   827→   827→              <div className="px-4 py-2.5 border-b border-gray-800 flex items-center gap-2">
+   828→   828→                <Box className="w-3.5 h-3.5 text-teal-400" />
+   829→   829→                <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+   830→   830→                  3D Preview
+   831→   831→                </h2>
+   832→   832→                {viewerMounted && (
+   833→   833→                  <span className="ml-auto text-xs text-emerald-400 flex items-center gap-1">
+   834→   834→                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+   835→   835→                    Live
+   836→   836→                  </span>
+   837→   837→                )}
+   838→   838→              </div>
+   839→   839→              <div className="flex-1 relative bg-[#080c14]">
+   840→   840→                {/* React must NOT render children into this div */}
+   841→   841→                <div
+   842→   842→                  ref={viewerContainerRef}
+   843→   843→                  className="absolute inset-0"
+   844→   844→                />
+   845→   845→                {!viewerMounted && !file && (
+   846→   846→                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-gray-600">
+   847→   847→                    <Box className="w-16 h-16 opacity-20" />
+   848→   848→                    <p className="text-sm">Upload an SCS file to preview</p>
+   849→   849→                  </div>
+   850→   850→                )}
+   851→   851→                {!viewerMounted && file && (
+   852→   852→                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-400">
+   853→   853→                    <Loader2 className="w-8 h-8 animate-spin text-emerald-500" />
+   854→   854→                    <p className="text-sm">Loading 3D viewer...</p>
+   855→   855→                  </div>
+   856→   856→                )}
+   857→   857→              </div>
+   858→   858→            </div>
+   859→   859→          </div>
+   860→   860→        </div>
+   861→   861→      </main>
+   862→   862→
+   863→   863→      {/* ──── Footer ──── */}
+   864→   864→      <footer className="border-t border-gray-800/60 bg-[#0a0f1a]/80 mt-auto">
+   865→   865→        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-600">
+   866→   866→          <span>
+   867→   867→            SCS &rarr; STL Converter &middot; Powered by HOOPS Communicator
+   868→   868→          </span>
+   869→   869→          <span>
+   870→   870→            All processing happens locally in your browser. No data is uploaded.
+   871→   871→          </span>
+   872→   872→        </div>
+   873→   873→      </footer>
+   874→   874→    </div>
+   875→   875→  );
+   876→   876→}
+   877→   877→
