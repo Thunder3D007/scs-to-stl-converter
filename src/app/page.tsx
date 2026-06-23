@@ -116,10 +116,10 @@ function findWebViewer(rootEl: HTMLElement): unknown {
     for (const p of props) {
       if (!p.startsWith('__reactFiber') && !p.startsWith('__reactInternalInstance'))
         continue;
-      const found = walkFiber(safe(() => (el as Record<string, unknown>)[p]), 0);
+      const found = walkFiber(safe(() => (el as unknown as Record<string, unknown>)[p]), 0);
       if (found) return found;
     }
-    for (const c of Array.from(el.children)) stack.push(c);
+    for (const c of Array.from(el.children) as HTMLElement[]) stack.push(c);
   }
   return null;
 }
@@ -419,7 +419,7 @@ export default function ScsToStlPage() {
     if (document.getElementById('hoops-bundle')) {
       // Script tag already exists; check if loaded
       const check = () => {
-        if ((window as Record<string, unknown>).GcHoopsViewer) {
+        if ((window as unknown as Record<string, unknown>).GcHoopsViewer) {
           setHoopsReady(true);
           addLog('HOOPS engine ready.', 'success');
         }
@@ -435,7 +435,7 @@ export default function ScsToStlPage() {
     script.onload = () => {
       // Give the bundle a tick to initialise
       const poll = setInterval(() => {
-        if ((window as Record<string, unknown>).GcHoopsViewer) {
+        if ((window as unknown as Record<string, unknown>).GcHoopsViewer) {
           clearInterval(poll);
           setHoopsReady(true);
           addLog('HOOPS engine ready.', 'success');
@@ -451,7 +451,7 @@ export default function ScsToStlPage() {
   /* ---------- mountAndWait ---------- */
   const mountAndWait = useCallback(
     async (fileToMount: File): Promise<Record<string, unknown>> => {
-      const GcHoopsViewer = (window as Record<string, unknown>)
+      const GcHoopsViewer = (window as unknown as Record<string, unknown>)
         .GcHoopsViewer as Record<string, unknown> | undefined;
       if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== 'function') {
         throw new Error(
@@ -504,13 +504,13 @@ export default function ScsToStlPage() {
               hwv as { getModel: () => unknown }
             ).getModel() as Record<string, unknown>
           : (hwv as Record<string, unknown>).model;
-      if (!model || typeof model.getNodeChildren !== 'function') {
+      if (!model || typeof (model as Record<string, unknown>).getNodeChildren !== 'function') {
         throw new Error('Model surface unrecognized');
       }
 
       addLog('Streaming geometry...');
       await waitFor(
-        () => (modelHasGeometry(model) ? true : null),
+        () => (modelHasGeometry(model as Record<string, unknown>) ? true : null),
         60000,
         'model geometry',
       );
@@ -539,16 +539,26 @@ export default function ScsToStlPage() {
       await sleep(500);
       hideHoopsUI(freshDiv);
 
-      return model;
+      return model as Record<string, unknown>;
     },
     [addLog],
   );
 
   /* ---------- Handle file selection ---------- */
+  const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+
   const handleFile = useCallback(
     async (f: File) => {
       if (!f.name.toLowerCase().endsWith('.scs')) {
         addLog('Please select an .scs file.', 'error');
+        return;
+      }
+      if (f.size > MAX_FILE_SIZE) {
+        addLog(`File too large (${formatBytes(f.size)}). Maximum is 500 MB.`, 'error');
+        return;
+      }
+      if (f.size === 0) {
+        addLog('File is empty.', 'error');
         return;
       }
       setFile(f);
