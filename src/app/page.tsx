@@ -1,6 +1,10 @@
 "use client";
 
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useCallback, useMemo } from "react";
+import { decompress } from "fzstd";
+import { Canvas, useLoader } from "@react-three/fiber";
+import { OrbitControls, Environment } from "@react-three/drei";
+import * as THREE from "three";
 import {
   Upload,
   Download,
@@ -28,6 +32,13 @@ interface ConvertLog {
   type: "info" | "success" | "error";
 }
 
+interface ParsedMesh {
+  positions: Float32Array;
+  normals: Float32Array;
+  triCount: number;
+  indices: Uint32Array;
+}
+
 /* ─── helpers ─── */
 function logMsg(msg: string, type: ConvertLog["type"] = "info"): ConvertLog {
   return { time: new Date().toLocaleTimeString(), msg, type };
@@ -41,137 +52,214 @@ function formatBytes(b: number): string {
 
 function triggerDownload(data: ArrayBuffer, name: string) {
   const blob = new Blob([data], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 0);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/* ─── safe wrapper ─── */
-function safe<T>(fn: () => T): T | undefined {
-  try {
-    return fn();
-  } catch {
-    return undefined;
+/* ─── SCS PARSER (Direct ZSTD method) ─── */
+
+/** Find all ZSTD frame start offsets in the data (magic: 0x28B52FFD) */
+function findZstdFrames(data: Uint8Array): number[] {
+  const offsets: number[] = [];
+  const len = data.length - 4;
+  for (let i = 0; i < len; i++) {
+    if (
+      data[i] === 0x28 &&
+      data[i + 1] === 0xb5 &&
+      data[i + 2] === 0x2f &&
+      data[i + 3] === 0xfd
+    ) {
+      offsets.push(i);
+    }
   }
+  return offsets;
 }
 
-/* ─── HOOPS detection helpers ─── */
-function looksLikeViewer(v: unknown): boolean {
-  if (!v || typeof v !== "object") return false;
-  const m =
-    safe(() => (v as Record<string, unknown>).model) ??
-    safe(() =>
-      typeof (v as Record<string, unknown>).getModel === "function"
-        ? (v as Record<string, { getModel: () => unknown }>).getModel()
-        : undefined
-    );
-  return !!(
-    m &&
-    typeof (m as Record<string, unknown>).getNodeChildren === "function"
+/** Parse an SCS file and extract all triangle geometry */
+function parseSCS(scsData: Uint8Array, flipZ: boolean): ParsedMesh {
+  const offsets = findZstdFrames(scsData);
+  const allVerts: number[] = [];
+  const allNormals: number[] = [];
+  let totalTris = 0;
+
+  for (let i = 0; i < offsets.length; i++) {
+    const start = offsets[i];
+    // Determine the end of this ZSTD frame (next frame start or end of data)
+    const end = i + 1 < offsets.length ? offsets[i + 1] : scsData.length;
+    const frameData = scsData.slice(start, end);
+
+    let decompressed: Uint8Array;
+    try {
+      decompressed = decompress(frameData);
+    } catch {
+      // Not a valid ZSTD frame or decompression error — skip
+      continue;
+    }
+
+    // Check for geometry frame header: 0x72000000 (little-endian)
+    if (decompressed.length < 16) continue;
+    if (
+      decompressed[0] !== 0x72 ||
+      decompressed[1] !== 0x00 ||
+      decompressed[2] !== 0x00 ||
+      decompressed[3] !== 0x00
+    ) {
+      continue;
+    }
+
+    // Skip the 12-byte geometry header, payload starts at offset 12
+    // Each vertex: position(3 float32) + normal(3 float32) = 24 bytes = 6 floats
+    const payload = decompressed.slice(12);
+    const stride = 24; // bytes per vertex (6 floats * 4 bytes)
+    const numVerts = Math.floor(payload.length / stride);
+    if (numVerts < 3) continue;
+
+    const actualSize = numVerts * stride;
+    const floatView = new DataView(payload.buffer, payload.byteOffset, actualSize);
+
+    // Validate: check that at least 30% of vertices have finite, reasonable values
+    let validCount = 0;
+    for (let v = 0; v < numVerts; v++) {
+      const base = v * 6;
+      const x = floatView.getFloat32(base * 4, true);
+      const y = floatView.getFloat32((base + 1) * 4, true);
+      const z = floatView.getFloat32((base + 2) * 4, true);
+      if (isFinite(x) && isFinite(y) && isFinite(z) && Math.abs(x) < 500 && Math.abs(y) < 500 && Math.abs(z) < 500) {
+        validCount++;
+      }
+    }
+
+    if (validCount < numVerts * 0.3) continue;
+
+    // Group into triangles: every 3 consecutive vertices = 1 triangle
+    const numTris = Math.floor(numVerts / 3);
+    if (numTris === 0) continue;
+
+    for (let t = 0; t < numTris; t++) {
+      let nx = 0, ny = 0, nz = 0;
+      for (let v = 0; v < 3; v++) {
+        const base = (t * 3 + v) * 6;
+        const px = floatView.getFloat32(base * 4, true);
+        const py = floatView.getFloat32((base + 1) * 4, true);
+        const pz = floatView.getFloat32((base + 2) * 4, true);
+        const nnx = floatView.getFloat32((base + 3) * 4, true);
+        const nny = floatView.getFloat32((base + 4) * 4, true);
+        const nnz = floatView.getFloat32((base + 5) * 4, true);
+
+        allVerts.push(px, flipZ ? py : py, flipZ ? -pz : pz);
+        nx += nnx;
+        ny += nny;
+        nz += flipZ ? -nnz : nnz;
+      }
+      // Face normal = average of 3 vertex normals
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      allNormals.push(nx / len, ny / len, nz / len);
+      totalTris++;
+    }
+  }
+
+  if (totalTris === 0) {
+    throw new Error("No geometry found in SCS file. The file may be empty or use an unsupported format.");
+  }
+
+  // Build Three.js-compatible buffers
+  const positions = new Float32Array(allVerts);
+  const normals = new Float32Array(allNormals);
+  const indices = new Uint32Array(totalTris * 3);
+  for (let i = 0; i < totalTris * 3; i++) {
+    indices[i] = i;
+  }
+
+  return { positions, normals, triCount: totalTris, indices };
+}
+
+/** Build binary STL from parsed mesh */
+function buildSTL(mesh: ParsedMesh): TriResult {
+  const { triCount, positions, normals: faceNormals } = mesh;
+  const buffer = new ArrayBuffer(84 + triCount * 50);
+  const dv = new DataView(buffer);
+
+  // 80-byte header (null-padded)
+  const header = "Binary STL - SCS Converter";
+  for (let i = 0; i < 80; i++) {
+    dv.setUint8(i, i < header.length ? header.charCodeAt(i) : 0);
+  }
+
+  // Triangle count at offset 80
+  dv.setUint32(80, triCount, true);
+
+  // Write triangles
+  let off = 84;
+  for (let t = 0; t < triCount; t++) {
+    // Face normal (3 floats)
+    dv.setFloat32(off, faceNormals[t * 3], true);
+    dv.setFloat32(off + 4, faceNormals[t * 3 + 1], true);
+    dv.setFloat32(off + 8, faceNormals[t * 3 + 2], true);
+    off += 12;
+
+    // 3 vertices
+    for (let v = 0; v < 3; v++) {
+      const vi = (t * 3 + v) * 3;
+      dv.setFloat32(off, positions[vi], true);
+      dv.setFloat32(off + 4, positions[vi + 1], true);
+      dv.setFloat32(off + 8, positions[vi + 2], true);
+      off += 12;
+    }
+
+    // Attribute byte count
+    dv.setUint16(off, 0, true);
+    off += 2;
+  }
+
+  return { triCount, bytes: buffer };
+}
+
+/* ─── 3D Preview Component ─── */
+function MeshPreview({ mesh }: { mesh: ParsedMesh }) {
+  const geometry = useMemo(() => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
+    geo.setAttribute("normal", new THREE.BufferAttribute(mesh.normals, 3));
+    geo.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+    geo.computeVertexNormals();
+    return geo;
+  }, [mesh]);
+
+  return (
+    <mesh geometry={geometry} castShadow receiveShadow>
+      <meshStandardMaterial
+        color="#10b981"
+        metalness={0.1}
+        roughness={0.6}
+        side={THREE.DoubleSide}
+      />
+    </mesh>
   );
 }
 
-function findWebViewer(rootEl: HTMLElement): unknown {
-  const seen = new WeakSet();
-  function walkFiber(fiber: unknown, depth: number): unknown {
-    if (!fiber || depth > 200 || seen.has(fiber as object)) return null;
-    seen.add(fiber as object);
-    for (const key of [
-      "stateNode",
-      "memoizedState",
-      "memoizedProps",
-      "ref",
-    ] as const) {
-      const v = safe(() => (fiber as Record<string, unknown>)[key]);
-      if (looksLikeViewer(v)) return v;
-      if (v && typeof v === "object") {
-        const cur = safe(() => (v as { current?: unknown }).current);
-        if (looksLikeViewer(cur)) return cur;
-        let h = v as Record<string, unknown>;
-        for (let i = 0; i < 80 && h; i++) {
-          if (looksLikeViewer(h)) return h;
-          const hc = safe(() => (h as { current?: unknown }).current);
-          if (looksLikeViewer(hc)) return hc;
-          for (const k of ["baseState", "memoizedState"] as const) {
-            const inner = safe(() => (h as Record<string, unknown>)[k]);
-            if (looksLikeViewer(inner)) return inner;
-          }
-          h = safe(() => (h as { next?: unknown }).next) as Record<
-            string,
-            unknown
-          >;
-        }
-      }
-    }
-    return (
-      walkFiber(
-        safe(() => (fiber as { child?: unknown }).child),
-        depth + 1
-      ) ??
-      walkFiber(
-        safe(() => (fiber as { sibling?: unknown }).sibling),
-        depth + 1
-      )
-    );
-  }
-
-  const stack = [rootEl];
-  while (stack.length) {
-    const el = stack.pop()!;
-    const props = safe(() => Object.getOwnPropertyNames(el)) ?? [];
-    for (const p of props) {
-      if (
-        !p.startsWith("__reactFiber") &&
-        !p.startsWith("__reactInternalInstance")
-      )
-        continue;
-      const found = walkFiber(safe(() => (el as Record<string, unknown>)[p]), 0);
-      if (found) return found;
-    }
-    for (const c of Array.from(el.children)) stack.push(c);
-  }
-  return null;
-}
-
-function modelHasGeometry(model: Record<string, unknown>): boolean {
-  try {
-    const root =
-      typeof model.getAbsoluteRootNode === "function"
-        ? (model.getAbsoluteRootNode as () => unknown)()
-        : typeof model.getRootNode === "function"
-          ? (model.getRootNode as () => unknown)()
-          : null;
-    const kids =
-      typeof model.getNodeChildren === "function"
-        ? (model.getNodeChildren as (n: unknown) => unknown[])(root)
-        : [];
-    return Array.isArray(kids) && kids.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-/* ─── polling ─── */
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function waitFor<T>(
-  check: () => T | null,
-  timeoutMs: number,
-  label: string
-): Promise<T> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const v = check();
-    if (v) return v;
-    await sleep(150);
-  }
-  throw new Error(`Timed out waiting for ${label} (${timeoutMs}ms)`);
+function Scene({ mesh }: { mesh: ParsedMesh }) {
+  return (
+    <>
+      <ambientLight intensity={0.4} />
+      <directionalLight position={[5, 10, 7]} intensity={1.2} castShadow />
+      <directionalLight position={[-3, -5, -5]} intensity={0.3} />
+      <MeshPreview mesh={mesh} />
+      <OrbitControls
+        makeDefault
+        enableDamping
+        dampingFactor={0.1}
+        autoRotate
+        autoRotateSpeed={1}
+      />
+      <Environment preset="studio" />
+    </>
+  );
 }
 
 /* ─── main page ─── */
@@ -179,236 +267,14 @@ export default function SCSConverter() {
   const [logs, setLogs] = useState<ConvertLog[]>([]);
   const [file, setFile] = useState<File | null>(null);
   const [converting, setConverting] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [modelReady, setModelReady] = useState(false);
+  const [parsing, setParsing] = useState(false);
+  const [mesh, setMesh] = useState<ParsedMesh | null>(null);
   const [flipZ, setFlipZ] = useState(true);
   const [result, setResult] = useState<TriResult | null>(null);
-  const viewerRef = useRef<HTMLDivElement>(null);
-  const mountedRef = useRef(false);
-  const blobUrlRef = useRef<string | null>(null);
-  const fileRef = useRef<File | null>(null);
 
   const addLog = useCallback((msg: string, type: ConvertLog["type"] = "info") => {
     setLogs((prev) => [...prev, logMsg(msg, type)]);
   }, []);
-
-  /* ─── load HOOPS bundle ─── */
-  useEffect(() => {
-    if (document.getElementById("hoops-bundle")) return;
-    const script = document.createElement("script");
-    script.id = "hoops-bundle";
-    script.src = "/hoops/bundle.js";
-    script.async = true;
-    document.head.appendChild(script);
-  }, []);
-
-  /* ─── mount viewer ─── */
-  const mountAndWait = useCallback(async (fileToMount?: File) => {
-    const f = fileToMount ?? fileRef.current;
-    if (!f) throw new Error("No file selected");
-
-    const GcHoopsViewer = (window as Record<string, unknown>)
-      .GcHoopsViewer as Record<string, unknown> | undefined;
-    if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== "function") {
-      throw new Error("HOOPS Viewer bundle did not load");
-    }
-
-    if (mountedRef.current) {
-      try {
-        (GcHoopsViewer.unmountViewer as () => void)();
-      } catch {}
-      mountedRef.current = false;
-    }
-    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-    blobUrlRef.current = URL.createObjectURL(f);
-
-    addLog("Loading 3D viewer...");
-    (GcHoopsViewer.mountViewer as (
-      el: HTMLElement,
-      opts: Record<string, unknown>
-    ) => void)(viewerRef.current!, {
-      file: blobUrlRef.current,
-      onAction: () => {},
-      onError: (e: unknown) => addLog(`Viewer error: ${e}`, "error"),
-    });
-    mountedRef.current = true;
-
-    addLog("Waiting for WebViewer...");
-    const hwv = await waitFor(
-      () => findWebViewer(viewerRef.current!) as Record<string, unknown> | null,
-      20000,
-      "WebViewer instance"
-    );
-    addLog("WebViewer found.");
-
-    const model =
-      typeof (hwv as Record<string, unknown>).getModel === "function"
-        ? ((hwv as { getModel: () => unknown }).getModel() as Record<
-            string,
-            unknown
-          >)
-        : (hwv as Record<string, unknown>).model;
-    if (!model || typeof model.getNodeChildren !== "function") {
-      throw new Error("Model surface unrecognized");
-    }
-
-    addLog("Streaming geometry...");
-    await waitFor(
-      () => (modelHasGeometry(model) ? true : null),
-      60000,
-      "model geometry"
-    );
-    return model;
-  }, [addLog]);
-
-  /* ─── build STL ─── */
-  const buildStl = useCallback(
-    async (
-      model: Record<string, unknown>,
-      shouldFlipZ: boolean
-    ): Promise<TriResult> => {
-      const root =
-        typeof model.getAbsoluteRootNode === "function"
-          ? (model.getAbsoluteRootNode as () => unknown)()
-          : (model.getRootNode as () => unknown)();
-      const nodes = (model.getNodeChildren as (n: unknown) => unknown[])(root);
-
-      const transform = (
-        m: number[],
-        x: number,
-        y: number,
-        z: number
-      ): number[] => {
-        const o = [
-          m[0] * x + m[4] * y + m[8] * z + m[12],
-          m[1] * x + m[5] * y + m[9] * z + m[13],
-          m[2] * x + m[6] * y + m[10] * z + m[14],
-        ];
-        if (shouldFlipZ) o[2] = -o[2];
-        return o;
-      };
-
-      const transformDir = (
-        m: number[],
-        x: number,
-        y: number,
-        z: number
-      ): number[] => {
-        const o = [
-          m[0] * x + m[4] * y + m[8] * z,
-          m[1] * x + m[5] * y + m[9] * z,
-          m[2] * x + m[6] * y + m[10] * z,
-        ];
-        if (shouldFlipZ) o[2] = -o[2];
-        return o;
-      };
-
-      const tris: number[][] = [];
-      let triCount = 0;
-      let skipped = 0;
-
-      for (const id of nodes) {
-        let mesh: Record<string, unknown> | null = null;
-        try {
-          mesh = (await (model.getNodeMeshData as (id: unknown) => Promise<
-            Record<string, unknown>
-          >)(id)) as Record<string, unknown> | null;
-        } catch {
-          skipped++;
-          continue;
-        }
-        if (!mesh) continue;
-        const faces = mesh.faces as
-          | (Iterable<{ position: number[]; normal?: number[] }> & {
-              vertexCount?: number;
-            })
-          | undefined;
-        if (!faces || !faces[Symbol.iterator] || !faces.vertexCount) continue;
-
-        let matObj: unknown = null;
-        try {
-          if (typeof model.getNodeNetMatrix === "function")
-            matObj = (model.getNodeNetMatrix as (id: unknown) => unknown)(id);
-          else if (typeof model.getNetMatrix === "function")
-            matObj = (model.getNetMatrix as (id: unknown) => unknown)(id);
-          if (matObj && typeof (matObj as Promise<unknown>).then === "function")
-            matObj = await matObj;
-        } catch {
-          matObj = null;
-        }
-
-        let m: number[];
-        if (Array.isArray(matObj) && matObj.length === 16) m = matObj;
-        else if (
-          matObj &&
-          Array.isArray((matObj as { m?: number[] }).m) &&
-          (matObj as { m?: number[] }).m!.length === 16
-        )
-          m = (matObj as { m: number[] }).m;
-        else if (
-          matObj &&
-          typeof (matObj as { getElements?: () => number[] }).getElements ===
-            "function"
-        )
-          m = (matObj as { getElements: () => number[] }).getElements();
-        else m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-
-        const buf: { p: number[]; n: number[] | null }[] = [];
-        for (const v of faces) {
-          buf.push({
-            p: [v.position[0], v.position[1], v.position[2]],
-            n: v.normal
-              ? [v.normal[0], v.normal[1], v.normal[2]]
-              : null,
-          });
-          if (buf.length === 3) {
-            const [a, b, c] = buf;
-            const p0 = transform(m, a.p[0], a.p[1], a.p[2]);
-            const p1 = transform(m, b.p[0], b.p[1], b.p[2]);
-            const p2 = transform(m, c.p[0], c.p[1], c.p[2]);
-            const n = a.n
-              ? transformDir(m, a.n[0], a.n[1], a.n[2])
-              : [0, 0, 0];
-            if (shouldFlipZ) {
-              tris.push([
-                n[0], n[1], n[2],
-                p0[0], p0[1], p0[2],
-                p2[0], p2[1], p2[2],
-                p1[0], p1[1], p1[2],
-              ]);
-            } else {
-              tris.push([
-                n[0], n[1], n[2],
-                p0[0], p0[1], p0[2],
-                p1[0], p1[1], p1[2],
-                p2[0], p2[1], p2[2],
-              ]);
-            }
-            triCount++;
-            buf.length = 0;
-          }
-        }
-      }
-
-      if (skipped) addLog(`Skipped ${skipped} nodes with errors`, "error");
-      if (!triCount) throw new Error("No triangles collected");
-
-      /* binary STL */
-      const buffer = new ArrayBuffer(84 + triCount * 50);
-      const dv = new DataView(buffer);
-      dv.setUint32(80, triCount, true);
-      let off = 84;
-      for (const t of tris) {
-        for (let i = 0; i < 12; i++) dv.setFloat32(off + i * 4, t[i], true);
-        off += 48;
-        dv.setUint16(off, 0, true);
-        off += 2;
-      }
-
-      return { triCount, bytes: buffer };
-    },
-    [addLog]
-  );
 
   /* ─── file handler ─── */
   const handleFile = useCallback(
@@ -417,44 +283,76 @@ export default function SCSConverter() {
         addLog("Please select an .scs file", "error");
         return;
       }
+
       setFile(f);
-      fileRef.current = f;
       setResult(null);
-      setModelReady(false);
+      setMesh(null);
       setLogs([logMsg(`Selected: ${f.name} (${formatBytes(f.size)})`)]);
-      setLoading(true);
+      setParsing(true);
 
       try {
-        const model = await mountAndWait(f);
-        addLog("Model loaded — ready to convert", "success");
-        setModelReady(true);
+        addLog("Reading file...");
+        const buffer = await f.arrayBuffer();
+        const data = new Uint8Array(buffer);
+        addLog(`File loaded: ${formatBytes(data.length)} — scanning ZSTD frames...`);
+
+        const parsed = parseSCS(data, flipZ);
+        setMesh(parsed);
+        addLog(
+          `Parsed: ${parsed.triCount.toLocaleString()} triangles, ${(parsed.positions.length / 3).toLocaleString()} vertices`,
+          "success"
+        );
       } catch (e) {
         addLog(
-          `Preview failed: ${e instanceof Error ? e.message : String(e)}`,
+          `Parse failed: ${e instanceof Error ? e.message : String(e)}`,
           "error"
         );
       } finally {
-        setLoading(false);
+        setParsing(false);
       }
     },
-    [mountAndWait, addLog]
+    [flipZ, addLog]
   );
+
+  /* ─── re-parse when flipZ changes ─── */
+  const handleReparse = useCallback(async () => {
+    if (!file) return;
+    setResult(null);
+    setParsing(true);
+    addLog(`Re-parsing with Z-flip ${flipZ ? "ON" : "OFF"}...`);
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const data = new Uint8Array(buffer);
+      const parsed = parseSCS(data, flipZ);
+      setMesh(parsed);
+      addLog(
+        `Re-parsed: ${parsed.triCount.toLocaleString()} triangles`,
+        "success"
+      );
+    } catch (e) {
+      addLog(
+        `Re-parse failed: ${e instanceof Error ? e.message : String(e)}`,
+        "error"
+      );
+    } finally {
+      setParsing(false);
+    }
+  }, [file, flipZ, addLog]);
 
   /* ─── convert ─── */
   const handleConvert = useCallback(async () => {
-    if (!file) return;
+    if (!mesh) return;
     setConverting(true);
-    setResult(null);
-    addLog("Starting conversion...");
+    addLog("Building binary STL...");
 
     try {
-      const model = await mountAndWait();
-      await sleep(750);
-      addLog("Extracting mesh data...");
-      const stl = await buildStl(model, flipZ);
+      // Use setTimeout to let the UI update before heavy computation
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      const stl = buildSTL(mesh);
       setResult(stl);
       addLog(
-        `Built STL: ${stl.triCount.toLocaleString()} triangles, ${formatBytes(stl.bytes.byteLength)}`,
+        `STL ready: ${stl.triCount.toLocaleString()} triangles, ${formatBytes(stl.bytes.byteLength)}`,
         "success"
       );
     } catch (e) {
@@ -465,7 +363,7 @@ export default function SCSConverter() {
     } finally {
       setConverting(false);
     }
-  }, [file, flipZ, mountAndWait, buildStl, addLog]);
+  }, [mesh, addLog]);
 
   /* ─── download ─── */
   const handleDownload = useCallback(() => {
@@ -479,13 +377,10 @@ export default function SCSConverter() {
   const handleReset = useCallback(() => {
     setFile(null);
     setResult(null);
-    setModelReady(false);
-    setLoading(false);
+    setMesh(null);
+    setParsing(false);
     setConverting(false);
     setLogs([]);
-    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-    blobUrlRef.current = null;
-    mountedRef.current = false;
   }, []);
 
   /* ─── drag & drop ─── */
@@ -518,7 +413,7 @@ export default function SCSConverter() {
                 SCS → STL Converter
               </h1>
               <p className="text-xs text-muted-foreground">
-                Powered by HOOPS Communicator Engine
+                Direct ZSTD decompression — no server upload
               </p>
             </div>
           </div>
@@ -583,8 +478,8 @@ export default function SCSConverter() {
                   },
                   {
                     icon: Zap,
-                    title: "Exact Geometry",
-                    desc: "Uses official HOOPS engine for perfect mesh",
+                    title: "Direct ZSTD",
+                    desc: "No HOOPS engine — pure JS decompression",
                   },
                   {
                     icon: FlipVertical,
@@ -625,10 +520,28 @@ export default function SCSConverter() {
                       {formatBytes(file.size)}
                     </p>
                   </div>
-                  {modelReady && (
+                  {mesh && (
                     <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
                   )}
                 </div>
+
+                {/* Stats */}
+                {mesh && (
+                  <div className="grid grid-cols-2 gap-3 mb-4">
+                    <div>
+                      <p className="text-muted-foreground text-xs">Triangles</p>
+                      <p className="font-mono font-medium text-sm">
+                        {mesh.triCount.toLocaleString()}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-muted-foreground text-xs">Vertices</p>
+                      <p className="font-mono font-medium text-sm">
+                        {(mesh.positions.length / 3).toLocaleString()}
+                      </p>
+                    </div>
+                  </div>
+                )}
 
                 {/* Settings */}
                 <div className="space-y-3 pt-3 border-t border-border/50">
@@ -654,6 +567,13 @@ export default function SCSConverter() {
                       </p>
                     </div>
                   </label>
+                  <button
+                    onClick={handleReparse}
+                    disabled={!mesh || parsing}
+                    className="w-full text-xs py-1.5 rounded-lg border border-border hover:bg-accent disabled:opacity-40 transition-colors"
+                  >
+                    Apply & Re-parse
+                  </button>
                 </div>
               </div>
 
@@ -661,7 +581,7 @@ export default function SCSConverter() {
               <div className="flex flex-col gap-2">
                 <button
                   onClick={handleConvert}
-                  disabled={!modelReady || converting}
+                  disabled={!mesh || converting}
                   className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-medium shadow-lg shadow-emerald-500/20 hover:shadow-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
                 >
                   {converting ? (
@@ -754,7 +674,7 @@ export default function SCSConverter() {
                       <span>{l.msg}</span>
                     </div>
                   ))}
-                  {(loading || converting) && (
+                  {(parsing || converting) && (
                     <div className="flex items-center gap-2 text-emerald-400">
                       <Loader2 className="w-3 h-3 animate-spin" />
                       <span>Processing...</span>
@@ -771,7 +691,7 @@ export default function SCSConverter() {
                   <Eye className="w-3.5 h-3.5" />
                   3D Preview
                 </div>
-                {!modelReady && !loading && (
+                {!mesh && !parsing && (
                   <div className="flex items-center justify-center h-full text-muted-foreground">
                     <div className="text-center">
                       <Box className="w-12 h-12 mx-auto mb-3 opacity-20" />
@@ -779,21 +699,26 @@ export default function SCSConverter() {
                     </div>
                   </div>
                 )}
-                {loading && (
+                {parsing && (
                   <div className="flex items-center justify-center h-full">
                     <div className="text-center">
                       <Loader2 className="w-8 h-8 mx-auto mb-3 animate-spin text-emerald-500" />
                       <p className="text-sm text-muted-foreground">
-                        Loading 3D viewer...
+                        Parsing SCS file...
                       </p>
                     </div>
                   </div>
                 )}
-                <div
-                  ref={viewerRef}
-                  className="w-full h-full"
-                  style={{ minHeight: "400px" }}
-                />
+                {mesh && !parsing && (
+                  <div className="w-full h-full" style={{ minHeight: "400px" }}>
+                    <Canvas
+                      camera={{ position: [50, 50, 50], fov: 50 }}
+                      style={{ width: "100%", height: "100%", minHeight: "400px" }}
+                    >
+                      <Scene mesh={mesh} />
+                    </Canvas>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -804,7 +729,7 @@ export default function SCSConverter() {
       <footer className="border-t border-border/50 py-4 mt-auto">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between text-xs text-muted-foreground">
           <p>
-            SCS → STL Converter • HOOPS Communicator Engine
+            SCS → STL Converter • Direct ZSTD Decompression
           </p>
           <p>100% client-side • No data uploaded</p>
         </div>
