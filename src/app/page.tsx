@@ -15,6 +15,7 @@ import {
   Loader2,
   FileBox,
   FlipVertical,
+  Layers,
 } from 'lucide-react';
 
 /* ------------------------------------------------------------------ */
@@ -32,6 +33,21 @@ interface TriResult {
   triCount: number;
   bytes: ArrayBuffer;
 }
+
+/* Quality presets — target triangle ratios */
+type QualityPreset = 'draft' | 'standard' | 'high' | 'original';
+const QUALITY_LABELS: Record<QualityPreset, string> = {
+  draft: 'Draft (~5%)',
+  standard: 'Standard (~25%)',
+  high: 'High (~60%)',
+  original: 'Original (100%)',
+};
+const QUALITY_RATIOS: Record<QualityPreset, number> = {
+  draft: 0.05,
+  standard: 0.25,
+  high: 0.60,
+  original: 1.0,
+};
 
 /* ------------------------------------------------------------------ */
 /*  Utility helpers                                                    */
@@ -360,6 +376,120 @@ async function buildStl(
 /*  Format helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Simplify a binary STL using meshoptimizer edge-collapse.
+ * Converts triangle soup → indexed mesh → simplify → binary STL.
+ */
+async function simplifyStl(
+  stlBytes: ArrayBuffer,
+  triCount: number,
+  targetRatio: number,
+  addLog: (text: string, level?: LogEntry['level']) => void,
+): Promise<TriResult> {
+  // Dynamic import — meshoptimizer WASM loads on demand
+  const { MeshoptSimplifier } = await import('meshoptimizer');
+  await MeshoptSimplifier.ready;
+
+  addLog(`Simplifier ready. Original: ${triCount.toLocaleString()} triangles`);
+
+  // Parse binary STL → vertex positions
+  const dv = new DataView(stlBytes);
+  const positions: number[] = []; // x,y,z per vertex (3 floats × triCount × 3 vertices)
+  for (let i = 0; i < triCount; i++) {
+    const off = 84 + i * 50;
+    for (let v = 0; v < 3; v++) {
+      const voff = off + 12 + v * 12; // skip normal (12 bytes), then 3 vertices
+      positions.push(dv.getFloat32(voff, true));     // x
+      positions.push(dv.getFloat32(voff + 4, true));  // y
+      positions.push(dv.getFloat32(voff + 8, true));  // z
+    }
+  }
+
+  // Deduplicate vertices: build indexed mesh
+  const vertexMap = new Map<string, number>();
+  const uniquePositions: number[] = [];
+  const indices: number[] = [];
+  let nextIdx = 0;
+
+  for (let i = 0; i < positions.length; i += 3) {
+    const key = `${positions[i]},${positions[i + 1]},${positions[i + 2]}`;
+    let idx = vertexMap.get(key);
+    if (idx === undefined) {
+      idx = nextIdx++;
+      vertexMap.set(key, idx);
+      uniquePositions.push(positions[i], positions[i + 1], positions[i + 2]);
+    }
+    indices.push(idx);
+  }
+
+  addLog(`Indexed mesh: ${nextIdx.toLocaleString()} vertices, ${(indices.length / 3).toLocaleString()} triangles`);
+
+  // Run edge-collapse simplification
+  const targetIndexCount = Math.max(3, Math.floor(indices.length * targetRatio));
+  const positionArray = new Float32Array(uniquePositions);
+  const indexArray = new Uint32Array(indices);
+
+  const [simplifiedIndices, _simplifiedCount] = MeshoptSimplifier.simplify(
+    indexArray,
+    positionArray,
+    3, // stride = 3 floats per vertex
+    targetIndexCount,
+    0.02, // target error (2% — barely visible)
+  );
+
+  const newTriCount = simplifiedIndices.length / 3;
+  addLog(`Simplified to ${newTriCount.toLocaleString()} triangles (${Math.round((newTriCount / triCount) * 100)}%)`, 'success');
+
+  // Rebuild binary STL from simplified mesh
+  // We need normals — compute them from triangle vertices
+  const buffer = new ArrayBuffer(84 + newTriCount * 50);
+  const out = new DataView(buffer);
+  out.setUint32(80, newTriCount, true);
+
+  let off = 84;
+  for (let t = 0; t < newTriCount; t++) {
+    const i0 = simplifiedIndices[t * 3];
+    const i1 = simplifiedIndices[t * 3 + 1];
+    const i2 = simplifiedIndices[t * 3 + 2];
+
+    const p0 = [positionArray[i0 * 3], positionArray[i0 * 3 + 1], positionArray[i0 * 3 + 2]];
+    const p1 = [positionArray[i1 * 3], positionArray[i1 * 3 + 1], positionArray[i1 * 3 + 2]];
+    const p2 = [positionArray[i2 * 3], positionArray[i2 * 3 + 1], positionArray[i2 * 3 + 2]];
+
+    // Compute face normal
+    const e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+    const e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+    const n = [
+      e1[1] * e2[2] - e1[2] * e2[1],
+      e1[2] * e2[0] - e1[0] * e2[2],
+      e1[0] * e2[1] - e1[1] * e2[0],
+    ];
+    const len = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) || 1;
+    n[0] /= len; n[1] /= len; n[2] /= len;
+
+    // Normal
+    out.setFloat32(off, n[0], true); off += 4;
+    out.setFloat32(off, n[1], true); off += 4;
+    out.setFloat32(off, n[2], true); off += 4;
+    // Vertex 0
+    out.setFloat32(off, p0[0], true); off += 4;
+    out.setFloat32(off, p0[1], true); off += 4;
+    out.setFloat32(off, p0[2], true); off += 4;
+    // Vertex 1
+    out.setFloat32(off, p1[0], true); off += 4;
+    out.setFloat32(off, p1[1], true); off += 4;
+    out.setFloat32(off, p1[2], true); off += 4;
+    // Vertex 2
+    out.setFloat32(off, p2[0], true); off += 4;
+    out.setFloat32(off, p2[1], true); off += 4;
+    out.setFloat32(off, p2[2], true); off += 4;
+    // Attribute
+    out.setUint16(off, 0, true); off += 2;
+  }
+
+  return { triCount: newTriCount, bytes: buffer };
+}
+
 function formatBytes(b: number): string {
   if (b < 1024) return `${b} B`;
   if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
@@ -382,6 +512,7 @@ export default function ScsToStlPage() {
   // State
   const [file, setFile] = useState<File | null>(null);
   const [flipZ, setFlipZ] = useState(true);
+  const [quality, setQuality] = useState<QualityPreset>('standard');
   const [converting, setConverting] = useState(false);
   const [stlResult, setStlResult] = useState<TriResult | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -685,14 +816,25 @@ export default function ScsToStlPage() {
     addLog('Starting conversion...');
 
     try {
-      const result = await buildStl(modelRef.current, flipZ);
+      let result = await buildStl(modelRef.current, flipZ);
+      addLog(
+        `Raw extraction: ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
+      );
+
+      // Apply mesh simplification if quality < original
+      if (quality !== 'original') {
+        const ratio = QUALITY_RATIOS[quality];
+        addLog(`Simplifying to ${QUALITY_LABELS[quality]}...`);
+        result = await simplifyStl(result.bytes, result.triCount, ratio, addLog);
+      }
+
       setStlResult(result);
       if (stlUrlRef.current) URL.revokeObjectURL(stlUrlRef.current);
       stlUrlRef.current = URL.createObjectURL(
         new Blob([result.bytes], { type: 'application/octet-stream' }),
       );
       addLog(
-        `Conversion done! ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
+        `Done! ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
         'success',
       );
     } catch (err) {
@@ -703,7 +845,7 @@ export default function ScsToStlPage() {
     } finally {
       setConverting(false);
     }
-  }, [flipZ, addLog]);
+  }, [flipZ, quality, addLog]);
 
   /* ---------- Download ---------- */
   const handleDownload = useCallback(() => {
@@ -896,6 +1038,60 @@ export default function ScsToStlPage() {
                   onCheckedChange={setFlipZ}
                   className="data-[state=checked]:bg-emerald-600"
                 />
+              </div>
+
+              {/* Quality Selector */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <Layers className="w-4 h-4 text-teal-400" />
+                  <div>
+                    <p className="text-sm font-medium text-gray-200">
+                      Quality
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Lower = smaller file
+                    </p>
+                  </div>
+                </div>
+                <select
+                  value={quality}
+                  onChange={(e) => setQuality(e.target.value as QualityPreset)}
+                  className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 cursor-pointer"
+                >
+                  {(Object.keys(QUALITY_LABELS) as QualityPreset[]).map((q) => (
+                    <option key={q} value={q}>
+                      {QUALITY_LABELS[q]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Quality Info */}
+              <div className="rounded-lg bg-gray-900/60 p-2.5 text-xs text-gray-500 space-y-1">
+                {quality === 'draft' && (
+                  <>
+                    <p className="text-amber-400 font-medium">Draft — ~5% of triangles</p>
+                    <p>Good for: test prints, checking fit &amp; scale</p>
+                  </>
+                )}
+                {quality === 'standard' && (
+                  <>
+                    <p className="text-emerald-400 font-medium">Standard — ~25% of triangles</p>
+                    <p>Good for: most 3D prints, best size/quality ratio</p>
+                  </>
+                )}
+                {quality === 'high' && (
+                  <>
+                    <p className="text-blue-400 font-medium">High — ~60% of triangles</p>
+                    <p>Good for: detailed miniatures, visible surface detail</p>
+                  </>
+                )}
+                {quality === 'original' && (
+                  <>
+                    <p className="text-purple-400 font-medium">Original — 100% lossless</p>
+                    <p>Good for: archival, re-editing. File may be very large.</p>
+                  </>
+                )}
               </div>
             </div>
 
