@@ -379,6 +379,7 @@ async function buildStl(
 /**
  * Simplify a binary STL using meshoptimizer edge-collapse.
  * Converts triangle soup → indexed mesh → simplify → binary STL.
+ * Falls back to the original STL if simplification fails (OOM, etc).
  */
 async function simplifyStl(
   stlBytes: ArrayBuffer,
@@ -386,108 +387,136 @@ async function simplifyStl(
   targetRatio: number,
   addLog: (text: string, level?: LogEntry['level']) => void,
 ): Promise<TriResult> {
-  // Dynamic import — meshoptimizer WASM loads on demand
-  const { MeshoptSimplifier } = await import('meshoptimizer');
-  await MeshoptSimplifier.ready;
+  try {
+    // Dynamic import — meshoptimizer WASM loads on demand
+    const { MeshoptSimplifier } = await import('meshoptimizer');
+    await MeshoptSimplifier.ready;
 
-  addLog(`Simplifier ready. Original: ${triCount.toLocaleString()} triangles`);
+    addLog(`Simplifier ready. Original: ${triCount.toLocaleString()} triangles`);
 
-  // Parse binary STL → vertex positions
-  const dv = new DataView(stlBytes);
-  const positions: number[] = []; // x,y,z per vertex (3 floats × triCount × 3 vertices)
-  for (let i = 0; i < triCount; i++) {
-    const off = 84 + i * 50;
-    for (let v = 0; v < 3; v++) {
-      const voff = off + 12 + v * 12; // skip normal (12 bytes), then 3 vertices
-      positions.push(dv.getFloat32(voff, true));     // x
-      positions.push(dv.getFloat32(voff + 4, true));  // y
-      positions.push(dv.getFloat32(voff + 8, true));  // z
+    // Memory guard: for very large meshes, use simplifySloppy which
+    // doesn't require vertex deduplication and uses much less memory
+    const LARGE_MESH_THRESHOLD = 2_000_000; // 2M triangles
+    const useSloppy = triCount > LARGE_MESH_THRESHOLD;
+
+    // Parse binary STL → vertex positions
+    const dv = new DataView(stlBytes);
+    const vertexCount = triCount * 3;
+    const positionArray = new Float32Array(vertexCount * 3);
+
+    for (let i = 0; i < triCount; i++) {
+      const off = 84 + i * 50;
+      for (let v = 0; v < 3; v++) {
+        const voff = off + 12 + v * 12;
+        const idx = (i * 3 + v) * 3;
+        positionArray[idx] = dv.getFloat32(voff, true);
+        positionArray[idx + 1] = dv.getFloat32(voff + 4, true);
+        positionArray[idx + 2] = dv.getFloat32(voff + 8, true);
+      }
     }
-  }
 
-  // Deduplicate vertices: build indexed mesh
-  const vertexMap = new Map<string, number>();
-  const uniquePositions: number[] = [];
-  const indices: number[] = [];
-  let nextIdx = 0;
+    // Build index buffer (0, 1, 2, 3, 4, 5, ...)
+    const indexArray = new Uint32Array(vertexCount);
+    for (let i = 0; i < vertexCount; i++) indexArray[i] = i;
 
-  for (let i = 0; i < positions.length; i += 3) {
-    const key = `${positions[i]},${positions[i + 1]},${positions[i + 2]}`;
-    let idx = vertexMap.get(key);
-    if (idx === undefined) {
-      idx = nextIdx++;
-      vertexMap.set(key, idx);
-      uniquePositions.push(positions[i], positions[i + 1], positions[i + 2]);
+    const targetIndexCount = Math.max(3, Math.floor(vertexCount * targetRatio));
+
+    let simplifiedIndices: Uint32Array;
+
+    if (useSloppy) {
+      // simplifySloppy — uses less memory, no topological guarantees
+      // but works on huge meshes that would OOM the standard path
+      addLog('Using fast simplifier (large mesh mode)...');
+      const [sloppyIndices] = MeshoptSimplifier.simplifySloppy(
+        indexArray,
+        positionArray,
+        3,
+        null,
+        targetIndexCount,
+        0.02,
+      );
+      simplifiedIndices = sloppyIndices;
+    } else {
+      // Standard simplify — better quality, needs indexed mesh
+      // Compact mesh first to deduplicate vertices
+      addLog('Deduplicating vertices...');
+      const [remap, uniqueCount] = MeshoptSimplifier.compactMesh(indexArray);
+
+      const compactPositions = new Float32Array(uniqueCount * 3);
+      for (let i = 0; i < vertexCount; i++) {
+        const srcIdx = i * 3;
+        const dstIdx = remap[i] * 3;
+        compactPositions[dstIdx] = positionArray[srcIdx];
+        compactPositions[dstIdx + 1] = positionArray[srcIdx + 1];
+        compactPositions[dstIdx + 2] = positionArray[srcIdx + 2];
+      }
+
+      // Remap indices
+      const compactIndices = new Uint32Array(vertexCount);
+      for (let i = 0; i < vertexCount; i++) compactIndices[i] = remap[i];
+
+      addLog(`Indexed: ${uniqueCount.toLocaleString()} unique vertices`);
+
+      const [stdIndices] = MeshoptSimplifier.simplify(
+        compactIndices,
+        compactPositions,
+        3,
+        targetIndexCount,
+        0.02,
+      );
+      simplifiedIndices = stdIndices;
+      // Use compactPositions for rebuild
+      positionArray.set(compactPositions);
     }
-    indices.push(idx);
+
+    const newTriCount = simplifiedIndices.length / 3;
+    addLog(`Simplified to ${newTriCount.toLocaleString()} triangles (${Math.round((newTriCount / triCount) * 100)}%)`, 'success');
+
+    // Rebuild binary STL from simplified mesh
+    const buffer = new ArrayBuffer(84 + newTriCount * 50);
+    const out = new DataView(buffer);
+    out.setUint32(80, newTriCount, true);
+
+    let off = 84;
+    for (let t = 0; t < newTriCount; t++) {
+      const i0 = simplifiedIndices[t * 3];
+      const i1 = simplifiedIndices[t * 3 + 1];
+      const i2 = simplifiedIndices[t * 3 + 2];
+
+      const p0x = positionArray[i0 * 3], p0y = positionArray[i0 * 3 + 1], p0z = positionArray[i0 * 3 + 2];
+      const p1x = positionArray[i1 * 3], p1y = positionArray[i1 * 3 + 1], p1z = positionArray[i1 * 3 + 2];
+      const p2x = positionArray[i2 * 3], p2y = positionArray[i2 * 3 + 1], p2z = positionArray[i2 * 3 + 2];
+
+      // Compute face normal
+      const e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
+      const e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= len; ny /= len; nz /= len;
+
+      out.setFloat32(off, nx, true); off += 4;
+      out.setFloat32(off, ny, true); off += 4;
+      out.setFloat32(off, nz, true); off += 4;
+      out.setFloat32(off, p0x, true); off += 4;
+      out.setFloat32(off, p0y, true); off += 4;
+      out.setFloat32(off, p0z, true); off += 4;
+      out.setFloat32(off, p1x, true); off += 4;
+      out.setFloat32(off, p1y, true); off += 4;
+      out.setFloat32(off, p1z, true); off += 4;
+      out.setFloat32(off, p2x, true); off += 4;
+      out.setFloat32(off, p2y, true); off += 4;
+      out.setFloat32(off, p2z, true); off += 4;
+      out.setUint16(off, 0, true); off += 2;
+    }
+
+    return { triCount: newTriCount, bytes: buffer };
+  } catch (err) {
+    // If simplification fails (OOM, etc), return the original STL
+    addLog(`Simplification failed (${err instanceof Error ? err.message : String(err)}). Using original mesh.`, 'error');
+    return { triCount, bytes: stlBytes };
   }
-
-  addLog(`Indexed mesh: ${nextIdx.toLocaleString()} vertices, ${(indices.length / 3).toLocaleString()} triangles`);
-
-  // Run edge-collapse simplification
-  const targetIndexCount = Math.max(3, Math.floor(indices.length * targetRatio));
-  const positionArray = new Float32Array(uniquePositions);
-  const indexArray = new Uint32Array(indices);
-
-  const [simplifiedIndices, _simplifiedCount] = MeshoptSimplifier.simplify(
-    indexArray,
-    positionArray,
-    3, // stride = 3 floats per vertex
-    targetIndexCount,
-    0.02, // target error (2% — barely visible)
-  );
-
-  const newTriCount = simplifiedIndices.length / 3;
-  addLog(`Simplified to ${newTriCount.toLocaleString()} triangles (${Math.round((newTriCount / triCount) * 100)}%)`, 'success');
-
-  // Rebuild binary STL from simplified mesh
-  // We need normals — compute them from triangle vertices
-  const buffer = new ArrayBuffer(84 + newTriCount * 50);
-  const out = new DataView(buffer);
-  out.setUint32(80, newTriCount, true);
-
-  let off = 84;
-  for (let t = 0; t < newTriCount; t++) {
-    const i0 = simplifiedIndices[t * 3];
-    const i1 = simplifiedIndices[t * 3 + 1];
-    const i2 = simplifiedIndices[t * 3 + 2];
-
-    const p0 = [positionArray[i0 * 3], positionArray[i0 * 3 + 1], positionArray[i0 * 3 + 2]];
-    const p1 = [positionArray[i1 * 3], positionArray[i1 * 3 + 1], positionArray[i1 * 3 + 2]];
-    const p2 = [positionArray[i2 * 3], positionArray[i2 * 3 + 1], positionArray[i2 * 3 + 2]];
-
-    // Compute face normal
-    const e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-    const e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-    const n = [
-      e1[1] * e2[2] - e1[2] * e2[1],
-      e1[2] * e2[0] - e1[0] * e2[2],
-      e1[0] * e2[1] - e1[1] * e2[0],
-    ];
-    const len = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) || 1;
-    n[0] /= len; n[1] /= len; n[2] /= len;
-
-    // Normal
-    out.setFloat32(off, n[0], true); off += 4;
-    out.setFloat32(off, n[1], true); off += 4;
-    out.setFloat32(off, n[2], true); off += 4;
-    // Vertex 0
-    out.setFloat32(off, p0[0], true); off += 4;
-    out.setFloat32(off, p0[1], true); off += 4;
-    out.setFloat32(off, p0[2], true); off += 4;
-    // Vertex 1
-    out.setFloat32(off, p1[0], true); off += 4;
-    out.setFloat32(off, p1[1], true); off += 4;
-    out.setFloat32(off, p1[2], true); off += 4;
-    // Vertex 2
-    out.setFloat32(off, p2[0], true); off += 4;
-    out.setFloat32(off, p2[1], true); off += 4;
-    out.setFloat32(off, p2[2], true); off += 4;
-    // Attribute
-    out.setUint16(off, 0, true); off += 2;
-  }
-
-  return { triCount: newTriCount, bytes: buffer };
 }
 
 function formatBytes(b: number): string {
@@ -671,74 +700,94 @@ export default function ScsToStlPage() {
       // Wait for FULL streaming completion.
       // SCS is a progressive format — geometry loads from low-res to high-res.
       // Converting too early gives a partial STL (150MB instead of 700MB).
-      // We use two strategies:
-      //   1. Register streamingDeactivated callback (fires when HOOPS finishes)
-      //   2. Poll getModelReady() as a fallback
+      // Strategy: watch the node count — when it stabilizes for 5 seconds,
+      // streaming is likely complete. Also try HOOPS callbacks as a bonus.
       addLog('Waiting for full geometry download...');
       let streamComplete = false;
 
       try {
-        // Strategy 1: Callback-based
-        if (typeof (hwv as Record<string, unknown>).setCallbacks === 'function') {
-          await new Promise<void>((resolve) => {
-            let resolved = false;
-            const done = () => {
-              if (resolved) return;
-              resolved = true;
-              streamComplete = true;
-              resolve();
-            };
-
+        // Try HOOPS callback-based detection
+        let callbackFired = false;
+        try {
+          if (typeof (hwv as Record<string, unknown>).setCallbacks === 'function') {
             (hwv as { setCallbacks: (c: Record<string, unknown>) => void }).setCallbacks({
-              streamingDeactivated: done,
-              sceneReady: done,
+              streamingDeactivated: () => { callbackFired = true; },
+              sceneReady: () => { callbackFired = true; },
             });
-
-            // Also poll getModelReady() as fallback in case
-            // streamingDeactivated already fired before we registered
-            const pollInterval = setInterval(() => {
-              try {
-                if (typeof (hwv as Record<string, unknown>).getModelReady === 'function') {
-                  if ((hwv as { getModelReady: () => boolean }).getModelReady()) {
-                    clearInterval(pollInterval);
-                    done();
-                  }
-                }
-              } catch {
-                // ignore
-              }
-            }, 1000);
-
-            // 90 second hard timeout
-            setTimeout(() => {
-              clearInterval(pollInterval);
-              if (!resolved) {
-                resolved = true;
-                addLog('Streaming timeout — converting with available geometry.', 'error');
-                resolve();
-              }
-            }, 90000);
-          });
-        } else {
-          // Strategy 2: Fallback — just poll getModelReady()
-          await waitFor(
-            () => {
-              try {
-                return typeof (hwv as Record<string, unknown>).getModelReady === 'function' &&
-                  (hwv as { getModelReady: () => boolean }).getModelReady()
-                  ? true : null;
-              } catch {
-                return null;
-              }
-            },
-            90000,
-            'full model ready',
-          );
-          streamComplete = true;
+          }
+        } catch {
+          // Non-critical
         }
+
+        // Poll: wait for streamingDeactivated callback OR stable node count
+        const root =
+          typeof (model as Record<string, unknown>).getAbsoluteRootNode === 'function'
+            ? ((model as Record<string, unknown>).getAbsoluteRootNode as () => unknown)()
+            : typeof (model as Record<string, unknown>).getRootNode === 'function'
+              ? ((model as Record<string, unknown>).getRootNode as () => unknown)()
+              : null;
+
+        let lastNodeCount = 0;
+        let stableTicks = 0;
+        const startTime = Date.now();
+
+        await new Promise<void>((resolve) => {
+          const pollInterval = setInterval(() => {
+            // Check HOOPS callback
+            if (callbackFired) {
+              clearInterval(pollInterval);
+              streamComplete = true;
+              addLog('Stream complete (callback).', 'success');
+              resolve();
+              return;
+            }
+
+            // Check model ready
+            try {
+              if (typeof (hwv as Record<string, unknown>).getModelReady === 'function' &&
+                  (hwv as { getModelReady: () => boolean }).getModelReady()) {
+                clearInterval(pollInterval);
+                streamComplete = true;
+                addLog('Stream complete (model ready).', 'success');
+                resolve();
+                return;
+              }
+            } catch {
+              // ignore
+            }
+
+            // Check stable node count
+            try {
+              const kids = typeof (model as Record<string, unknown>).getNodeChildren === 'function'
+                ? ((model as Record<string, unknown>).getNodeChildren as (n: unknown) => unknown[])(root)
+                : [];
+              const count = kids.length;
+              if (count === lastNodeCount && count > 0) {
+                stableTicks++;
+                if (stableTicks >= 5) { // 5 seconds of stable count
+                  clearInterval(pollInterval);
+                  streamComplete = true;
+                  addLog('Stream complete (stable).', 'success');
+                  resolve();
+                }
+              } else {
+                lastNodeCount = count;
+                stableTicks = 0;
+              }
+            } catch {
+              // ignore
+            }
+
+            // Hard timeout: 120 seconds
+            if (Date.now() - startTime > 120000) {
+              clearInterval(pollInterval);
+              addLog('Stream timeout — using available geometry.', 'error');
+              resolve();
+            }
+          }, 1000);
+        });
       } catch {
-        // Timeout or error — proceed with what we have
-        addLog('Stream wait timed out — converting with available geometry.', 'error');
+        addLog('Stream wait error — using available geometry.', 'error');
       }
 
       if (streamComplete) {
