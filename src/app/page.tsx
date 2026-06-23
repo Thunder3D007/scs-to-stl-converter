@@ -547,36 +547,46 @@ export default function ScsToStlPage() {
 
   /* ---------- Load HOOPS bundle ---------- */
   useEffect(() => {
-    if (document.getElementById('hoops-bundle')) {
-      // Script tag already exists; check if loaded
-      const check = () => {
-        if ((window as unknown as Record<string, unknown>).GcHoopsViewer) {
-          setHoopsReady(true);
-          addLog('HOOPS engine ready.', 'success');
-        }
-      };
-      check();
-      return;
-    }
-    addLog('Loading HOOPS Communicator engine...');
-    const script = document.createElement('script');
-    script.id = 'hoops-bundle';
-    script.src = '/hoops/bundle.js';
-    script.async = true;
-    script.onload = () => {
-      // Give the bundle a tick to initialise
-      const poll = setInterval(() => {
-        if ((window as unknown as Record<string, unknown>).GcHoopsViewer) {
-          clearInterval(poll);
-          setHoopsReady(true);
-          addLog('HOOPS engine ready.', 'success');
-        }
-      }, 200);
-      // Timeout after 30 s
-      setTimeout(() => clearInterval(poll), 30_000);
+    // The <script> tag is now in layout.tsx <head> so it starts loading
+    // immediately on page load. We just need to detect when it's ready.
+    const checkReady = () => {
+      if ((window as unknown as Record<string, unknown>).GcHoopsViewer) {
+        setHoopsReady(true);
+        addLog('HOOPS engine ready.', 'success');
+        return true;
+      }
+      return false;
     };
-    script.onerror = () => addLog('Failed to load HOOPS bundle.', 'error');
-    document.head.appendChild(script);
+
+    // Already loaded?
+    if (checkReady()) return;
+
+    // Wait for the script to load (it's already in <head>)
+    const existingScript = document.getElementById('hoops-bundle');
+    if (existingScript) {
+      const onLoad = () => {
+        const poll = setInterval(() => {
+          if (checkReady()) clearInterval(poll);
+        }, 200);
+        setTimeout(() => clearInterval(poll), 30_000);
+      };
+      existingScript.addEventListener('load', onLoad, { once: true });
+    } else {
+      // Fallback: create script if not in head (shouldn't happen)
+      addLog('Loading HOOPS Communicator engine...');
+      const script = document.createElement('script');
+      script.id = 'hoops-bundle';
+      script.src = '/hoops/bundle.js';
+      script.async = true;
+      script.onload = () => {
+        const poll = setInterval(() => {
+          if (checkReady()) clearInterval(poll);
+        }, 200);
+        setTimeout(() => clearInterval(poll), 30_000);
+      };
+      script.onerror = () => addLog('Failed to load HOOPS bundle.', 'error');
+      document.head.appendChild(script);
+    }
   }, [addLog]);
 
   /* ---------- mountAndWait ---------- */

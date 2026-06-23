@@ -35,6 +35,17 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Preload HOOPS Communicator engine — 6.2MB total.
+            Without these hints, the browser won't start downloading
+            until React hydrates and the useEffect fires, wasting 2-5 seconds. */}
+        <link rel="preload" href="/hoops/bundle.js" as="script" />
+        <link rel="preload" href="/hoops/engine.esm.wasm" as="fetch" crossOrigin="anonymous" />
+        {/* Also preload the root-level WASM copy that bundle.js may request */}
+        <link rel="preload" href="/engine.esm.wasm" as="fetch" crossOrigin="anonymous" />
+        {/* Start loading HOOPS bundle immediately — don't wait for React */}
+        <script id="hoops-bundle" src="/hoops/bundle.js" async></script>
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
