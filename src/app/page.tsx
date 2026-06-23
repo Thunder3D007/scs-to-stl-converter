@@ -1,588 +1,728 @@
-"use client";
+'use client';
 
-import React, { useState, useRef, useCallback, useMemo } from "react";
-import { decompress } from "fzstd";
-import { Canvas, useLoader } from "@react-three/fiber";
-import { OrbitControls, Environment } from "@react-three/drei";
-import * as THREE from "three";
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
+import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   Upload,
-  Download,
   Box,
-  Settings2,
+  Download,
   RotateCcw,
-  CheckCircle2,
   AlertCircle,
+  CheckCircle2,
+  Info,
   Loader2,
   FileBox,
-  Zap,
-  Eye,
   FlipVertical,
-} from "lucide-react";
+} from 'lucide-react';
 
-/* ─── types ─── */
+/* ------------------------------------------------------------------ */
+/*  Types                                                              */
+/* ------------------------------------------------------------------ */
+
+interface LogEntry {
+  id: number;
+  text: string;
+  level: 'info' | 'error' | 'success';
+  ts: string;
+}
+
 interface TriResult {
   triCount: number;
   bytes: ArrayBuffer;
 }
 
-interface ConvertLog {
-  time: string;
-  msg: string;
-  type: "info" | "success" | "error";
+/* ------------------------------------------------------------------ */
+/*  Utility helpers                                                    */
+/* ------------------------------------------------------------------ */
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-interface ParsedMesh {
-  positions: Float32Array;
-  normals: Float32Array;
-  triCount: number;
-  indices: Uint32Array;
+async function waitFor<T>(
+  check: () => T | null,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const v = check();
+    if (v) return v;
+    await sleep(150);
+  }
+  throw new Error(`Timed out waiting for ${label} (${timeoutMs}ms)`);
 }
 
-/* ─── helpers ─── */
-function logMsg(msg: string, type: ConvertLog["type"] = "info"): ConvertLog {
-  return { time: new Date().toLocaleTimeString(), msg, type };
+function safe<T>(fn: () => T): T | undefined {
+  try {
+    return fn();
+  } catch {
+    return undefined;
+  }
 }
+
+function looksLikeViewer(v: unknown): boolean {
+  if (!v || typeof v !== 'object') return false;
+  const m =
+    safe(() => (v as Record<string, unknown>).model) ??
+    safe(() =>
+      typeof (v as Record<string, unknown>).getModel === 'function'
+        ? (v as { getModel: () => unknown }).getModel()
+        : undefined,
+    );
+  return !!(m && typeof (m as Record<string, unknown>).getNodeChildren === 'function');
+}
+
+function findWebViewer(rootEl: HTMLElement): unknown {
+  const seen = new WeakSet();
+  function walkFiber(fiber: unknown, depth: number): unknown {
+    if (!fiber || depth > 200 || seen.has(fiber as object)) return null;
+    seen.add(fiber as object);
+    for (const key of [
+      'stateNode',
+      'memoizedState',
+      'memoizedProps',
+      'ref',
+    ] as const) {
+      const v = safe(() => (fiber as Record<string, unknown>)[key]);
+      if (looksLikeViewer(v)) return v;
+      if (v && typeof v === 'object') {
+        const cur = safe(() => (v as { current?: unknown }).current);
+        if (looksLikeViewer(cur)) return cur;
+        let h = v as Record<string, unknown>;
+        for (let i = 0; i < 80 && h; i++) {
+          if (looksLikeViewer(h)) return h;
+          const hc = safe(() => (h as { current?: unknown }).current);
+          if (looksLikeViewer(hc)) return hc;
+          for (const k of ['baseState', 'memoizedState'] as const) {
+            const inner = safe(() => (h as Record<string, unknown>)[k]);
+            if (looksLikeViewer(inner)) return inner;
+          }
+          h = safe(() => (h as { next?: unknown }).next) as Record<string, unknown>;
+        }
+      }
+    }
+    return (
+      walkFiber(safe(() => (fiber as { child?: unknown }).child), depth + 1) ??
+      walkFiber(safe(() => (fiber as { sibling?: unknown }).sibling), depth + 1)
+    );
+  }
+  const stack = [rootEl];
+  while (stack.length) {
+    const el = stack.pop()!;
+    const props = safe(() => Object.getOwnPropertyNames(el)) ?? [];
+    for (const p of props) {
+      if (!p.startsWith('__reactFiber') && !p.startsWith('__reactInternalInstance'))
+        continue;
+      const found = walkFiber(safe(() => (el as Record<string, unknown>)[p]), 0);
+      if (found) return found;
+    }
+    for (const c of Array.from(el.children)) stack.push(c);
+  }
+  return null;
+}
+
+function modelHasGeometry(model: Record<string, unknown>): boolean {
+  try {
+    const root =
+      typeof model.getAbsoluteRootNode === 'function'
+        ? (model.getAbsoluteRootNode as () => unknown)()
+        : typeof model.getRootNode === 'function'
+          ? (model.getRootNode as () => unknown)()
+          : null;
+    const kids =
+      typeof model.getNodeChildren === 'function'
+        ? (model.getNodeChildren as (n: unknown) => unknown[])(root)
+        : [];
+    return Array.isArray(kids) && kids.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function buildStl(
+  model: Record<string, unknown>,
+  flipZ: boolean,
+): Promise<TriResult> {
+  const root =
+    typeof model.getAbsoluteRootNode === 'function'
+      ? (model.getAbsoluteRootNode as () => unknown)()
+      : (model.getRootNode as () => unknown)();
+
+  // Walk ALL nodes recursively
+  const nodes: unknown[] = [];
+  (function walk(id: unknown) {
+    nodes.push(id);
+    for (const c of (
+      model.getNodeChildren as (n: unknown) => unknown[]
+    )(id) || [])
+      walk(c);
+  })(root);
+
+  const transform = (m: number[], x: number, y: number, z: number): number[] => {
+    const o = [
+      m[0] * x + m[4] * y + m[8] * z + m[12],
+      m[1] * x + m[5] * y + m[9] * z + m[13],
+      m[2] * x + m[6] * y + m[10] * z + m[14],
+    ];
+    if (flipZ) o[2] = -o[2];
+    return o;
+  };
+
+  const transformDir = (
+    m: number[],
+    x: number,
+    y: number,
+    z: number,
+  ): number[] => {
+    const o = [
+      m[0] * x + m[4] * y + m[8] * z,
+      m[1] * x + m[5] * y + m[9] * z,
+      m[2] * x + m[6] * y + m[10] * z,
+    ];
+    if (flipZ) o[2] = -o[2];
+    return o;
+  };
+
+  const tris: number[][] = [];
+  let triCount = 0;
+  let skipped = 0;
+
+  for (const id of nodes) {
+    let mesh: Record<string, unknown> | null = null;
+    try {
+      mesh = (await (
+        model.getNodeMeshData as (id: unknown) => Promise<Record<string, unknown>>
+      )(id)) as Record<string, unknown> | null;
+    } catch {
+      skipped++;
+      continue;
+    }
+    if (!mesh) continue;
+    const faces = mesh.faces as
+      | (Iterable<{ position: number[]; normal?: number[] }> & {
+          vertexCount?: number;
+        })
+      | undefined;
+    if (!faces || !faces[Symbol.iterator] || !faces.vertexCount) continue;
+
+    let matObj: unknown = null;
+    try {
+      if (typeof model.getNodeNetMatrix === 'function')
+        matObj = (model.getNodeNetMatrix as (id: unknown) => unknown)(id);
+      else if (typeof model.getNetMatrix === 'function')
+        matObj = (model.getNetMatrix as (id: unknown) => unknown)(id);
+      if (matObj && typeof (matObj as Promise<unknown>).then === 'function')
+        matObj = await matObj;
+    } catch {
+      matObj = null;
+    }
+
+    let m: number[];
+    if (Array.isArray(matObj) && matObj.length === 16) m = matObj;
+    else if (
+      matObj &&
+      Array.isArray((matObj as { m?: number[] }).m) &&
+      (matObj as { m?: number[] }).m!.length === 16
+    )
+      m = (matObj as { m: number[] }).m;
+    else if (
+      matObj &&
+      typeof (matObj as { getElements?: () => number[] }).getElements ===
+        'function'
+    )
+      m = (matObj as { getElements: () => number[] }).getElements();
+    else m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+
+    const buf: { p: number[]; n: number[] | null }[] = [];
+    for (const v of faces) {
+      buf.push({
+        p: [v.position[0], v.position[1], v.position[2]],
+        n: v.normal
+          ? [v.normal[0], v.normal[1], v.normal[2]]
+          : null,
+      });
+      if (buf.length === 3) {
+        const [a, b, c] = buf;
+        const p0 = transform(m, a.p[0], a.p[1], a.p[2]);
+        const p1 = transform(m, b.p[0], b.p[1], b.p[2]);
+        const p2 = transform(m, c.p[0], c.p[1], c.p[2]);
+        const n = a.n
+          ? transformDir(m, a.n[0], a.n[1], a.n[2])
+          : [0, 0, 0];
+        if (flipZ) {
+          tris.push([
+            n[0], n[1], n[2],
+            p0[0], p0[1], p0[2],
+            p2[0], p2[1], p2[2],
+            p1[0], p1[1], p1[2],
+          ]);
+        } else {
+          tris.push([
+            n[0], n[1], n[2],
+            p0[0], p0[1], p0[2],
+            p1[0], p1[1], p1[2],
+            p2[0], p2[1], p2[2],
+          ]);
+        }
+        triCount++;
+        buf.length = 0;
+      }
+    }
+  }
+
+  if (skipped) console.log(`Skipped ${skipped} nodes with errors`);
+  if (!triCount)
+    throw new Error(
+      'No triangles collected \u2014 model may not have streamed yet',
+    );
+
+  // Build binary STL
+  const buffer = new ArrayBuffer(84 + triCount * 50);
+  const dv = new DataView(buffer);
+  dv.setUint32(80, triCount, true);
+  let off = 84;
+  for (const t of tris) {
+    for (let i = 0; i < 12; i++) {
+      dv.setFloat32(off, t[i], true);
+      off += 4;
+    }
+    dv.setUint16(off, 0, true);
+    off += 2;
+  }
+  return { triCount, bytes: buffer };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Format helpers                                                     */
+/* ------------------------------------------------------------------ */
 
 function formatBytes(b: number): string {
   if (b < 1024) return `${b} B`;
   if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
-  return `${(b / 1048576).toFixed(2)} MB`;
+  return `${(b / 1048576).toFixed(1)} MB`;
 }
 
-function triggerDownload(data: ArrayBuffer, name: string) {
-  const blob = new Blob([data], { type: "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+function ts(): string {
+  return new Date().toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
 
-/* ─── SCS PARSER (Direct ZSTD method) ─── */
+/* ------------------------------------------------------------------ */
+/*  Main Component                                                     */
+/* ------------------------------------------------------------------ */
 
-/** Find all ZSTD frame start offsets in the data (magic: 0x28B52FFD) */
-function findZstdFrames(data: Uint8Array): number[] {
-  const offsets: number[] = [];
-  const len = data.length - 4;
-  for (let i = 0; i < len; i++) {
-    if (
-      data[i] === 0x28 &&
-      data[i + 1] === 0xb5 &&
-      data[i + 2] === 0x2f &&
-      data[i + 3] === 0xfd
-    ) {
-      offsets.push(i);
-    }
-  }
-  return offsets;
-}
-
-/** Parse an SCS file and extract all triangle geometry */
-function parseSCS(scsData: Uint8Array, flipZ: boolean): ParsedMesh {
-  const offsets = findZstdFrames(scsData);
-  const allVerts: number[] = [];
-  const allNormals: number[] = [];
-  let totalTris = 0;
-
-  for (let i = 0; i < offsets.length; i++) {
-    const start = offsets[i];
-    // Determine the end of this ZSTD frame (next frame start or end of data)
-    const end = i + 1 < offsets.length ? offsets[i + 1] : scsData.length;
-    const frameData = scsData.slice(start, end);
-
-    let decompressed: Uint8Array;
-    try {
-      decompressed = decompress(frameData);
-    } catch {
-      // Not a valid ZSTD frame or decompression error — skip
-      continue;
-    }
-
-    // Check for geometry frame header: 0x72000000 (little-endian)
-    if (decompressed.length < 16) continue;
-    if (
-      decompressed[0] !== 0x72 ||
-      decompressed[1] !== 0x00 ||
-      decompressed[2] !== 0x00 ||
-      decompressed[3] !== 0x00
-    ) {
-      continue;
-    }
-
-    // Skip the 12-byte geometry header, payload starts at offset 12
-    // Each vertex: position(3 float32) + normal(3 float32) = 24 bytes = 6 floats
-    const payload = decompressed.slice(12);
-    const stride = 24; // bytes per vertex (6 floats * 4 bytes)
-    const numVerts = Math.floor(payload.length / stride);
-    if (numVerts < 3) continue;
-
-    const actualSize = numVerts * stride;
-    const floatView = new DataView(payload.buffer, payload.byteOffset, actualSize);
-
-    // Validate: check that at least 30% of vertices have finite, reasonable values
-    let validCount = 0;
-    for (let v = 0; v < numVerts; v++) {
-      const base = v * 6;
-      const x = floatView.getFloat32(base * 4, true);
-      const y = floatView.getFloat32((base + 1) * 4, true);
-      const z = floatView.getFloat32((base + 2) * 4, true);
-      if (isFinite(x) && isFinite(y) && isFinite(z) && Math.abs(x) < 500 && Math.abs(y) < 500 && Math.abs(z) < 500) {
-        validCount++;
-      }
-    }
-
-    if (validCount < numVerts * 0.3) continue;
-
-    // Group into triangles: every 3 consecutive vertices = 1 triangle
-    const numTris = Math.floor(numVerts / 3);
-    if (numTris === 0) continue;
-
-    for (let t = 0; t < numTris; t++) {
-      let nx = 0, ny = 0, nz = 0;
-      for (let v = 0; v < 3; v++) {
-        const base = (t * 3 + v) * 6;
-        const px = floatView.getFloat32(base * 4, true);
-        const py = floatView.getFloat32((base + 1) * 4, true);
-        const pz = floatView.getFloat32((base + 2) * 4, true);
-        const nnx = floatView.getFloat32((base + 3) * 4, true);
-        const nny = floatView.getFloat32((base + 4) * 4, true);
-        const nnz = floatView.getFloat32((base + 5) * 4, true);
-
-        allVerts.push(px, flipZ ? py : py, flipZ ? -pz : pz);
-        nx += nnx;
-        ny += nny;
-        nz += flipZ ? -nnz : nnz;
-      }
-      // Face normal = average of 3 vertex normals
-      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-      allNormals.push(nx / len, ny / len, nz / len);
-      totalTris++;
-    }
-  }
-
-  if (totalTris === 0) {
-    throw new Error("No geometry found in SCS file. The file may be empty or use an unsupported format.");
-  }
-
-  // Build Three.js-compatible buffers
-  const positions = new Float32Array(allVerts);
-  const normals = new Float32Array(allNormals);
-  const indices = new Uint32Array(totalTris * 3);
-  for (let i = 0; i < totalTris * 3; i++) {
-    indices[i] = i;
-  }
-
-  return { positions, normals, triCount: totalTris, indices };
-}
-
-/** Build binary STL from parsed mesh */
-function buildSTL(mesh: ParsedMesh): TriResult {
-  const { triCount, positions, normals: faceNormals } = mesh;
-  const buffer = new ArrayBuffer(84 + triCount * 50);
-  const dv = new DataView(buffer);
-
-  // 80-byte header (null-padded)
-  const header = "Binary STL - SCS Converter";
-  for (let i = 0; i < 80; i++) {
-    dv.setUint8(i, i < header.length ? header.charCodeAt(i) : 0);
-  }
-
-  // Triangle count at offset 80
-  dv.setUint32(80, triCount, true);
-
-  // Write triangles
-  let off = 84;
-  for (let t = 0; t < triCount; t++) {
-    // Face normal (3 floats)
-    dv.setFloat32(off, faceNormals[t * 3], true);
-    dv.setFloat32(off + 4, faceNormals[t * 3 + 1], true);
-    dv.setFloat32(off + 8, faceNormals[t * 3 + 2], true);
-    off += 12;
-
-    // 3 vertices
-    for (let v = 0; v < 3; v++) {
-      const vi = (t * 3 + v) * 3;
-      dv.setFloat32(off, positions[vi], true);
-      dv.setFloat32(off + 4, positions[vi + 1], true);
-      dv.setFloat32(off + 8, positions[vi + 2], true);
-      off += 12;
-    }
-
-    // Attribute byte count
-    dv.setUint16(off, 0, true);
-    off += 2;
-  }
-
-  return { triCount, bytes: buffer };
-}
-
-/* ─── 3D Preview Component ─── */
-function MeshPreview({ mesh }: { mesh: ParsedMesh }) {
-  const geometry = useMemo(() => {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
-    geo.setAttribute("normal", new THREE.BufferAttribute(mesh.normals, 3));
-    geo.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
-    geo.computeVertexNormals();
-    return geo;
-  }, [mesh]);
-
-  return (
-    <mesh geometry={geometry} castShadow receiveShadow>
-      <meshStandardMaterial
-        color="#10b981"
-        metalness={0.1}
-        roughness={0.6}
-        side={THREE.DoubleSide}
-      />
-    </mesh>
-  );
-}
-
-function Scene({ mesh }: { mesh: ParsedMesh }) {
-  return (
-    <>
-      <ambientLight intensity={0.4} />
-      <directionalLight position={[5, 10, 7]} intensity={1.2} castShadow />
-      <directionalLight position={[-3, -5, -5]} intensity={0.3} />
-      <MeshPreview mesh={mesh} />
-      <OrbitControls
-        makeDefault
-        enableDamping
-        dampingFactor={0.1}
-        autoRotate
-        autoRotateSpeed={1}
-      />
-      <Environment preset="studio" />
-    </>
-  );
-}
-
-/* ─── main page ─── */
-export default function SCSConverter() {
-  const [logs, setLogs] = useState<ConvertLog[]>([]);
+export default function ScsToStlPage() {
+  // State
   const [file, setFile] = useState<File | null>(null);
-  const [converting, setConverting] = useState(false);
-  const [parsing, setParsing] = useState(false);
-  const [mesh, setMesh] = useState<ParsedMesh | null>(null);
   const [flipZ, setFlipZ] = useState(true);
-  const [result, setResult] = useState<TriResult | null>(null);
+  const [converting, setConverting] = useState(false);
+  const [stlResult, setStlResult] = useState<TriResult | null>(null);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [hoopsReady, setHoopsReady] = useState(false);
+  const [viewerMounted, setViewerMounted] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
 
-  const addLog = useCallback((msg: string, type: ConvertLog["type"] = "info") => {
-    setLogs((prev) => [...prev, logMsg(msg, type)]);
-  }, []);
+  // Refs — fileRef avoids stale closures; modelRef persists across renders
+  const fileRef = useRef<File | null>(null);
+  const modelRef = useRef<Record<string, unknown> | null>(null);
+  const viewerContainerRef = useRef<HTMLDivElement>(null);
+  const blobUrlRef = useRef<string>('');
+  const logIdRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const stlUrlRef = useRef<string>('');
 
-  /* ─── file handler ─── */
+  // Keep fileRef in sync with file state
+  useEffect(() => {
+    fileRef.current = file;
+  }, [file]);
+
+  /* ---------- Logging ---------- */
+  const addLog = useCallback(
+    (text: string, level: LogEntry['level'] = 'info') => {
+      setLogs((prev) => [
+        ...prev,
+        { id: ++logIdRef.current, text, level, ts: ts() },
+      ]);
+    },
+    [],
+  );
+
+  /* ---------- Load HOOPS bundle ---------- */
+  useEffect(() => {
+    if (document.getElementById('hoops-bundle')) {
+      // Script tag already exists; check if loaded
+      const check = () => {
+        if ((window as Record<string, unknown>).GcHoopsViewer) {
+          setHoopsReady(true);
+          addLog('HOOPS engine ready.', 'success');
+        }
+      };
+      check();
+      return;
+    }
+    addLog('Loading HOOPS Communicator engine...');
+    const script = document.createElement('script');
+    script.id = 'hoops-bundle';
+    script.src = '/hoops/bundle.js';
+    script.async = true;
+    script.onload = () => {
+      // Give the bundle a tick to initialise
+      const poll = setInterval(() => {
+        if ((window as Record<string, unknown>).GcHoopsViewer) {
+          clearInterval(poll);
+          setHoopsReady(true);
+          addLog('HOOPS engine ready.', 'success');
+        }
+      }, 200);
+      // Timeout after 30 s
+      setTimeout(() => clearInterval(poll), 30_000);
+    };
+    script.onerror = () => addLog('Failed to load HOOPS bundle.', 'error');
+    document.head.appendChild(script);
+  }, [addLog]);
+
+  /* ---------- mountAndWait ---------- */
+  const mountAndWait = useCallback(
+    async (fileToMount: File): Promise<Record<string, unknown>> => {
+      const GcHoopsViewer = (window as Record<string, unknown>)
+        .GcHoopsViewer as Record<string, unknown> | undefined;
+      if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== 'function') {
+        throw new Error(
+          'HOOPS Viewer engine is still loading. Please wait a moment and try again.',
+        );
+      }
+
+      // Create a FRESH div for HOOPS each time (prevents React conflict)
+      if (viewerContainerRef.current) {
+        while (viewerContainerRef.current.firstChild) {
+          viewerContainerRef.current.removeChild(
+            viewerContainerRef.current.firstChild,
+          );
+        }
+      }
+      const freshDiv = document.createElement('div');
+      freshDiv.style.width = '100%';
+      freshDiv.style.height = '100%';
+      freshDiv.style.minHeight = '400px';
+      viewerContainerRef.current?.appendChild(freshDiv);
+
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = URL.createObjectURL(fileToMount);
+
+      addLog('Mounting 3D viewer...');
+      (GcHoopsViewer.mountViewer as (
+        el: HTMLElement,
+        opts: Record<string, unknown>,
+      ) => void)(freshDiv, {
+        file: blobUrlRef.current,
+        onAction: () => {},
+        onError: (e: unknown) => addLog(`Viewer error: ${e}`, 'error'),
+      });
+
+      addLog('Waiting for WebViewer...');
+      const hwv = await waitFor(
+        () =>
+          findWebViewer(freshDiv) as Record<string, unknown> | null,
+        30000,
+        'WebViewer instance',
+      );
+      addLog('WebViewer found.', 'success');
+
+      const model =
+        typeof (hwv as Record<string, unknown>).getModel === 'function'
+          ? (
+              hwv as { getModel: () => unknown }
+            ).getModel() as Record<string, unknown>
+          : (hwv as Record<string, unknown>).model;
+      if (!model || typeof model.getNodeChildren !== 'function') {
+        throw new Error('Model surface unrecognized');
+      }
+
+      addLog('Streaming geometry...');
+      await waitFor(
+        () => (modelHasGeometry(model) ? true : null),
+        60000,
+        'model geometry',
+      );
+      addLog('Geometry streamed.', 'success');
+      return model;
+    },
+    [addLog],
+  );
+
+  /* ---------- Handle file selection ---------- */
   const handleFile = useCallback(
     async (f: File) => {
-      if (!f.name.toLowerCase().endsWith(".scs")) {
-        addLog("Please select an .scs file", "error");
+      if (!f.name.toLowerCase().endsWith('.scs')) {
+        addLog('Please select an .scs file.', 'error');
         return;
       }
-
       setFile(f);
-      setResult(null);
-      setMesh(null);
-      setLogs([logMsg(`Selected: ${f.name} (${formatBytes(f.size)})`)]);
-      setParsing(true);
+      setStlResult(null);
+      if (stlUrlRef.current) {
+        URL.revokeObjectURL(stlUrlRef.current);
+        stlUrlRef.current = '';
+      }
+      addLog(`File selected: ${f.name} (${formatBytes(f.size)})`);
 
       try {
-        addLog("Reading file...");
-        const buffer = await f.arrayBuffer();
-        const data = new Uint8Array(buffer);
-        addLog(`File loaded: ${formatBytes(data.length)} — scanning ZSTD frames...`);
-
-        const parsed = parseSCS(data, flipZ);
-        setMesh(parsed);
+        setViewerMounted(false);
+        const model = await mountAndWait(f);
+        modelRef.current = model;
+        setViewerMounted(true);
+      } catch (err) {
         addLog(
-          `Parsed: ${parsed.triCount.toLocaleString()} triangles, ${(parsed.positions.length / 3).toLocaleString()} vertices`,
-          "success"
+          `Mount failed: ${err instanceof Error ? err.message : String(err)}`,
+          'error',
         );
-      } catch (e) {
-        addLog(
-          `Parse failed: ${e instanceof Error ? e.message : String(e)}`,
-          "error"
-        );
-      } finally {
-        setParsing(false);
       }
     },
-    [flipZ, addLog]
+    [addLog, mountAndWait],
   );
 
-  /* ─── re-parse when flipZ changes ─── */
-  const handleReparse = useCallback(async () => {
-    if (!file) return;
-    setResult(null);
-    setParsing(true);
-    addLog(`Re-parsing with Z-flip ${flipZ ? "ON" : "OFF"}...`);
-
-    try {
-      const buffer = await file.arrayBuffer();
-      const data = new Uint8Array(buffer);
-      const parsed = parseSCS(data, flipZ);
-      setMesh(parsed);
-      addLog(
-        `Re-parsed: ${parsed.triCount.toLocaleString()} triangles`,
-        "success"
-      );
-    } catch (e) {
-      addLog(
-        `Re-parse failed: ${e instanceof Error ? e.message : String(e)}`,
-        "error"
-      );
-    } finally {
-      setParsing(false);
-    }
-  }, [file, flipZ, addLog]);
-
-  /* ─── convert ─── */
+  /* ---------- Convert ---------- */
   const handleConvert = useCallback(async () => {
-    if (!mesh) return;
+    const currentFile = fileRef.current;
+    if (!currentFile) return;
+    if (!modelRef.current) {
+      addLog('No model loaded. Please load a file first.', 'error');
+      return;
+    }
     setConverting(true);
-    addLog("Building binary STL...");
+    setStlResult(null);
+    addLog('Starting conversion...');
 
     try {
-      // Use setTimeout to let the UI update before heavy computation
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      const stl = buildSTL(mesh);
-      setResult(stl);
-      addLog(
-        `STL ready: ${stl.triCount.toLocaleString()} triangles, ${formatBytes(stl.bytes.byteLength)}`,
-        "success"
+      const result = await buildStl(modelRef.current, flipZ);
+      setStlResult(result);
+      if (stlUrlRef.current) URL.revokeObjectURL(stlUrlRef.current);
+      stlUrlRef.current = URL.createObjectURL(
+        new Blob([result.bytes], { type: 'application/octet-stream' }),
       );
-    } catch (e) {
       addLog(
-        `Conversion failed: ${e instanceof Error ? e.message : String(e)}`,
-        "error"
+        `Conversion done! ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
+        'success',
+      );
+    } catch (err) {
+      addLog(
+        `Conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+        'error',
       );
     } finally {
       setConverting(false);
     }
-  }, [mesh, addLog]);
+  }, [flipZ, addLog]);
 
-  /* ─── download ─── */
+  /* ---------- Download ---------- */
   const handleDownload = useCallback(() => {
-    if (!result || !file) return;
-    const name = file.name.replace(/\.scs$/i, "") + ".stl";
-    triggerDownload(result.bytes, name);
-    addLog(`Downloaded ${name}`, "success");
-  }, [result, file, addLog]);
+    if (!stlResult || !stlUrlRef.current || !fileRef.current) return;
+    const a = document.createElement('a');
+    a.href = stlUrlRef.current;
+    a.download = fileRef.current.name.replace(/\.scs$/i, '.stl');
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    addLog('STL file downloaded.', 'success');
+  }, [stlResult, addLog]);
 
-  /* ─── reset ─── */
+  /* ---------- Reset ---------- */
   const handleReset = useCallback(() => {
     setFile(null);
-    setResult(null);
-    setMesh(null);
-    setParsing(false);
-    setConverting(false);
+    fileRef.current = null;
+    setStlResult(null);
+    setViewerMounted(false);
+    modelRef.current = null;
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = '';
+    }
+    if (stlUrlRef.current) {
+      URL.revokeObjectURL(stlUrlRef.current);
+      stlUrlRef.current = '';
+    }
+    if (viewerContainerRef.current) {
+      while (viewerContainerRef.current.firstChild) {
+        viewerContainerRef.current.removeChild(
+          viewerContainerRef.current.firstChild,
+        );
+      }
+    }
     setLogs([]);
+    logIdRef.current = 0;
+    addLog('Reset complete.');
+  }, [addLog]);
+
+  /* ---------- Drag & Drop ---------- */
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
   }, []);
 
-  /* ─── drag & drop ─── */
-  const handleDrop = useCallback(
+  const onDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  }, []);
+
+  const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      const f = e.dataTransfer.files[0];
+      setDragOver(false);
+      const f = e.dataTransfer.files?.[0];
       if (f) handleFile(f);
     },
-    [handleFile]
+    [handleFile],
   );
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  }, []);
+  /* ---------- Auto-scroll log ---------- */
+  const logEndRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
 
+  /* ---------- Render ---------- */
   return (
-    <div className="min-h-screen flex flex-col bg-background">
-      {/* Header */}
-      <header className="border-b border-border/50 bg-card/50 backdrop-blur-sm sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
-              <Box className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight">
-                SCS → STL Converter
-              </h1>
-              <p className="text-xs text-muted-foreground">
-                Direct ZSTD decompression — no server upload
-              </p>
-            </div>
+    <div className="dark min-h-screen flex flex-col bg-[#0a0f1a] text-gray-100">
+      {/* ──── Header ──── */}
+      <header className="border-b border-emerald-900/40 bg-[#0d1422]/80 backdrop-blur-sm sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center gap-3">
+          <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-600 shadow-lg shadow-emerald-500/20">
+            <Box className="w-5 h-5 text-white" />
           </div>
-          {file && (
-            <button
-              onClick={handleReset}
-              className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg border border-border hover:bg-accent transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Reset
-            </button>
-          )}
+          <div>
+            <h1 className="text-lg font-bold tracking-tight">
+              <span className="text-emerald-400">SCS</span>
+              <span className="mx-1.5 text-gray-500">&rarr;</span>
+              <span className="text-teal-300">STL</span>
+              <span className="text-gray-400 font-normal ml-2 text-sm">
+                Converter
+              </span>
+            </h1>
+          </div>
+          <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+            {!hoopsReady && (
+              <span className="flex items-center gap-1.5 text-amber-400">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Loading engine...
+              </span>
+            )}
+            {hoopsReady && (
+              <span className="flex items-center gap-1.5 text-emerald-400">
+                <CheckCircle2 className="w-3 h-3" />
+                Engine ready
+              </span>
+            )}
+          </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6">
-        {!file ? (
-          /* ─── Upload Zone ─── */
-          <div className="flex items-center justify-center min-h-[70vh]">
+      {/* ──── Main ──── */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 h-full">
+          {/* ── Left Panel ── */}
+          <div className="lg:col-span-2 flex flex-col gap-4">
+            {/* Upload Zone */}
             <div
-              onDrop={handleDrop}
-              onDragOver={handleDragOver}
-              className="w-full max-w-2xl"
-            >
-              <div
-                className="border-2 border-dashed border-border rounded-2xl p-12 text-center hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-all duration-300 cursor-pointer group"
-                onClick={() =>
-                  document.getElementById("scs-file-input")?.click()
+              onDragOver={onDragOver}
+              onDragLeave={onDragLeave}
+              onDrop={onDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className={`
+                relative cursor-pointer rounded-xl border-2 border-dashed
+                transition-all duration-200 p-6 text-center
+                ${
+                  dragOver
+                    ? 'border-emerald-400 bg-emerald-500/10 scale-[1.01]'
+                    : file
+                      ? 'border-emerald-700/50 bg-emerald-950/20'
+                      : 'border-gray-700 bg-gray-900/40 hover:border-emerald-600/60 hover:bg-gray-900/60'
                 }
-              >
-                <div className="w-20 h-20 mx-auto rounded-2xl bg-gradient-to-br from-emerald-500/10 to-teal-500/10 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
-                  <Upload className="w-9 h-9 text-emerald-500" />
-                </div>
-                <h2 className="text-xl font-semibold mb-2">
-                  Drop your .scs file here
-                </h2>
-                <p className="text-muted-foreground text-sm mb-6">
-                  or click to browse — supports HOOPS Stream Cache format
-                </p>
-                <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 text-emerald-600 text-sm font-medium">
-                  <Zap className="w-3.5 h-3.5" />
-                  100% browser-based, no upload to server
-                </div>
-                <input
-                  id="scs-file-input"
-                  type="file"
-                  accept=".scs"
-                  className="hidden"
-                  onChange={(e) =>
-                    e.target.files?.[0] && handleFile(e.target.files[0])
-                  }
-                />
-              </div>
-
-              {/* Features */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-8">
-                {[
-                  {
-                    icon: Eye,
-                    title: "3D Preview",
-                    desc: "Visualize your model before converting",
-                  },
-                  {
-                    icon: Zap,
-                    title: "Direct ZSTD",
-                    desc: "No HOOPS engine — pure JS decompression",
-                  },
-                  {
-                    icon: FlipVertical,
-                    title: "Z-Flip Fix",
-                    desc: "Automatic Z-axis correction for slicers",
-                  },
-                ].map((feat) => (
-                  <div
-                    key={feat.title}
-                    className="flex items-start gap-3 p-4 rounded-xl border border-border/50 bg-card/50"
-                  >
-                    <feat.icon className="w-5 h-5 text-emerald-500 mt-0.5 shrink-0" />
-                    <div>
-                      <p className="text-sm font-medium">{feat.title}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {feat.desc}
-                      </p>
-                    </div>
+              `}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".scs"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleFile(f);
+                }}
+              />
+              {!file ? (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="w-14 h-14 rounded-full bg-emerald-900/40 flex items-center justify-center">
+                    <Upload className="w-7 h-7 text-emerald-400" />
                   </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        ) : (
-          /* ─── Workspace ─── */
-          <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-6 min-h-[70vh]">
-            {/* Left Panel */}
-            <div className="flex flex-col gap-4 order-2 lg:order-1">
-              {/* File Info Card */}
-              <div className="rounded-xl border border-border/50 bg-card/80 p-5">
-                <div className="flex items-center gap-3 mb-4">
-                  <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center">
-                    <FileBox className="w-5 h-5 text-emerald-500" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="font-medium text-sm truncate">{file.name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {formatBytes(file.size)}
+                  <div>
+                    <p className="font-medium text-gray-200">
+                      Drop your .scs file here
+                    </p>
+                    <p className="text-sm text-gray-500 mt-1">
+                      or click to browse
                     </p>
                   </div>
-                  {mesh && (
-                    <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
-                  )}
                 </div>
-
-                {/* Stats */}
-                {mesh && (
-                  <div className="grid grid-cols-2 gap-3 mb-4">
-                    <div>
-                      <p className="text-muted-foreground text-xs">Triangles</p>
-                      <p className="font-mono font-medium text-sm">
-                        {mesh.triCount.toLocaleString()}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-muted-foreground text-xs">Vertices</p>
-                      <p className="font-mono font-medium text-sm">
-                        {(mesh.positions.length / 3).toLocaleString()}
-                      </p>
-                    </div>
+              ) : (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="w-12 h-12 rounded-full bg-emerald-900/40 flex items-center justify-center">
+                    <FileBox className="w-6 h-6 text-emerald-400" />
                   </div>
-                )}
-
-                {/* Settings */}
-                <div className="space-y-3 pt-3 border-t border-border/50">
-                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
-                    <Settings2 className="w-3.5 h-3.5" />
-                    Settings
+                  <p className="font-semibold text-emerald-300 truncate max-w-full">
+                    {file.name}
                   </p>
-                  <label className="flex items-center gap-3 cursor-pointer group">
-                    <div className="relative">
-                      <input
-                        type="checkbox"
-                        checked={flipZ}
-                        onChange={(e) => setFlipZ(e.target.checked)}
-                        className="sr-only peer"
-                      />
-                      <div className="w-9 h-5 rounded-full bg-muted peer-checked:bg-emerald-500 transition-colors" />
-                      <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform peer-checked:translate-x-4" />
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium">Flip Z Axis</p>
-                      <p className="text-xs text-muted-foreground">
-                        Fix Y-up → Z-up for slicers
-                      </p>
-                    </div>
-                  </label>
-                  <button
-                    onClick={handleReparse}
-                    disabled={!mesh || parsing}
-                    className="w-full text-xs py-1.5 rounded-lg border border-border hover:bg-accent disabled:opacity-40 transition-colors"
-                  >
-                    Apply & Re-parse
-                  </button>
+                  <p className="text-sm text-gray-400">
+                    {formatBytes(file.size)}
+                  </p>
                 </div>
-              </div>
+              )}
+            </div>
 
-              {/* Action Buttons */}
-              <div className="flex flex-col gap-2">
-                <button
+            {/* Settings Card */}
+            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 p-4 space-y-4">
+              <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+                Settings
+              </h2>
+
+              {/* Flip Z Toggle */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <FlipVertical className="w-4 h-4 text-teal-400" />
+                  <div>
+                    <p className="text-sm font-medium text-gray-200">
+                      Flip Z-Axis
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      For slicer compatibility
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  checked={flipZ}
+                  onCheckedChange={setFlipZ}
+                  className="data-[state=checked]:bg-emerald-600"
+                />
+              </div>
+            </div>
+
+            {/* Actions Card */}
+            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 p-4 space-y-3">
+              <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+                Actions
+              </h2>
+              <div className="grid grid-cols-1 gap-2.5">
+                <Button
                   onClick={handleConvert}
-                  disabled={!mesh || converting}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-medium shadow-lg shadow-emerald-500/20 hover:shadow-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                  disabled={!viewerMounted || converting}
+                  className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-lg shadow-emerald-500/20 disabled:opacity-50 disabled:shadow-none"
                 >
                   {converting ? (
                     <>
@@ -591,147 +731,144 @@ export default function SCSConverter() {
                     </>
                   ) : (
                     <>
-                      <Zap className="w-4 h-4" />
+                      <Box className="w-4 h-4" />
                       Convert to STL
                     </>
                   )}
-                </button>
+                </Button>
 
-                {result && (
-                  <button
-                    onClick={handleDownload}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 border-emerald-500/30 text-emerald-600 font-medium hover:bg-emerald-500/10 transition-all"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download STL ({formatBytes(result.bytes.byteLength)})
-                  </button>
-                )}
+                <Button
+                  onClick={handleDownload}
+                  disabled={!stlResult}
+                  variant="outline"
+                  className="w-full border-emerald-700/50 text-emerald-300 hover:bg-emerald-950/40 hover:text-emerald-200 disabled:opacity-40"
+                >
+                  <Download className="w-4 h-4" />
+                  Download STL
+                  {stlResult && (
+                    <span className="text-xs text-gray-500 ml-1">
+                      ({formatBytes(stlResult.bytes.byteLength)})
+                    </span>
+                  )}
+                </Button>
+
+                <Button
+                  onClick={handleReset}
+                  variant="ghost"
+                  className="w-full text-gray-400 hover:text-gray-200 hover:bg-gray-800/60"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  Reset
+                </Button>
               </div>
 
-              {/* Result Card */}
-              {result && (
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-5">
-                  <div className="flex items-center gap-2 mb-3">
-                    <CheckCircle2 className="w-5 h-5 text-emerald-500" />
-                    <p className="font-semibold text-emerald-600">
-                      Conversion Successful
-                    </p>
+              {stlResult && (
+                <div className="mt-2 rounded-lg bg-emerald-950/30 border border-emerald-800/30 p-3">
+                  <div className="flex items-center gap-2 text-emerald-400 text-sm font-medium">
+                    <CheckCircle2 className="w-4 h-4" />
+                    Conversion Complete
                   </div>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div>
-                      <p className="text-muted-foreground text-xs">
-                        Triangles
-                      </p>
-                      <p className="font-mono font-medium">
-                        {result.triCount.toLocaleString()}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-muted-foreground text-xs">STL Size</p>
-                      <p className="font-mono font-medium">
-                        {formatBytes(result.bytes.byteLength)}
-                      </p>
-                    </div>
-                  </div>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {stlResult.triCount.toLocaleString()} triangles &middot;{' '}
+                    {formatBytes(stlResult.bytes.byteLength)}
+                  </p>
                 </div>
               )}
+            </div>
 
-              {/* Log */}
-              <div className="rounded-xl border border-border/50 bg-card/50 flex-1 min-h-[200px] overflow-hidden flex flex-col">
-                <div className="px-4 py-2 border-b border-border/50 flex items-center justify-between">
-                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                    Log
-                  </p>
-                  {logs.length > 0 && (
-                    <button
-                      onClick={() => setLogs([])}
-                      className="text-xs text-muted-foreground hover:text-foreground transition-colors"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-                <div className="p-3 font-mono text-xs space-y-1 overflow-y-auto max-h-[300px]">
+            {/* Log Panel */}
+            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 flex flex-col overflow-hidden flex-1 min-h-[200px]">
+              <div className="px-4 py-2.5 border-b border-gray-800 flex items-center gap-2">
+                <Info className="w-3.5 h-3.5 text-gray-500" />
+                <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
+                  Log
+                </h2>
+              </div>
+              <ScrollArea className="flex-1 max-h-64">
+                <div className="p-3 space-y-1 font-mono text-xs">
                   {logs.length === 0 && (
-                    <p className="text-muted-foreground">
+                    <p className="text-gray-600 italic">
                       Waiting for activity...
                     </p>
                   )}
-                  {logs.map((l, i) => (
+                  {logs.map((l) => (
                     <div
-                      key={i}
+                      key={l.id}
                       className={`flex gap-2 ${
-                        l.type === "error"
-                          ? "text-red-400"
-                          : l.type === "success"
-                            ? "text-emerald-400"
-                            : "text-muted-foreground"
+                        l.level === 'error'
+                          ? 'text-red-400'
+                          : l.level === 'success'
+                            ? 'text-emerald-400'
+                            : 'text-gray-400'
                       }`}
                     >
-                      <span className="text-muted-foreground/50 shrink-0">
-                        {l.time}
+                      <span className="text-gray-600 shrink-0">{l.ts}</span>
+                      <span className="shrink-0">
+                        {l.level === 'error' ? (
+                          <AlertCircle className="w-3 h-3 inline" />
+                        ) : l.level === 'success' ? (
+                          <CheckCircle2 className="w-3 h-3 inline" />
+                        ) : (
+                          <Info className="w-3 h-3 inline" />
+                        )}
                       </span>
-                      <span>{l.msg}</span>
+                      <span className="break-all">{l.text}</span>
                     </div>
                   ))}
-                  {(parsing || converting) && (
-                    <div className="flex items-center gap-2 text-emerald-400">
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                      <span>Processing...</span>
-                    </div>
-                  )}
+                  <div ref={logEndRef} />
                 </div>
-              </div>
+              </ScrollArea>
             </div>
+          </div>
 
-            {/* Right Panel - 3D Viewer */}
-            <div className="order-1 lg:order-2">
-              <div className="rounded-xl border border-border/50 bg-card/50 overflow-hidden h-full min-h-[400px] relative">
-                <div className="absolute top-3 left-3 z-10 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm text-xs text-white/80">
-                  <Eye className="w-3.5 h-3.5" />
+          {/* ── Right Panel — 3D Viewer ── */}
+          <div className="lg:col-span-3 flex flex-col">
+            <div className="rounded-xl border border-gray-800 bg-[#111827]/80 flex-1 flex flex-col overflow-hidden min-h-[400px]">
+              <div className="px-4 py-2.5 border-b border-gray-800 flex items-center gap-2">
+                <Box className="w-3.5 h-3.5 text-teal-400" />
+                <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wider">
                   3D Preview
-                </div>
-                {!mesh && !parsing && (
-                  <div className="flex items-center justify-center h-full text-muted-foreground">
-                    <div className="text-center">
-                      <Box className="w-12 h-12 mx-auto mb-3 opacity-20" />
-                      <p className="text-sm">Preview will appear here</p>
-                    </div>
+                </h2>
+                {viewerMounted && (
+                  <span className="ml-auto text-xs text-emerald-400 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    Live
+                  </span>
+                )}
+              </div>
+              <div className="flex-1 relative bg-[#080c14]">
+                {/* React must NOT render children into this div */}
+                <div
+                  ref={viewerContainerRef}
+                  className="absolute inset-0"
+                />
+                {!viewerMounted && !file && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 text-gray-600">
+                    <Box className="w-16 h-16 opacity-20" />
+                    <p className="text-sm">Upload an SCS file to preview</p>
                   </div>
                 )}
-                {parsing && (
-                  <div className="flex items-center justify-center h-full">
-                    <div className="text-center">
-                      <Loader2 className="w-8 h-8 mx-auto mb-3 animate-spin text-emerald-500" />
-                      <p className="text-sm text-muted-foreground">
-                        Parsing SCS file...
-                      </p>
-                    </div>
-                  </div>
-                )}
-                {mesh && !parsing && (
-                  <div className="w-full h-full" style={{ minHeight: "400px" }}>
-                    <Canvas
-                      camera={{ position: [50, 50, 50], fov: 50 }}
-                      style={{ width: "100%", height: "100%", minHeight: "400px" }}
-                    >
-                      <Scene mesh={mesh} />
-                    </Canvas>
+                {!viewerMounted && file && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-400">
+                    <Loader2 className="w-8 h-8 animate-spin text-emerald-500" />
+                    <p className="text-sm">Loading 3D viewer...</p>
                   </div>
                 )}
               </div>
             </div>
           </div>
-        )}
+        </div>
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-border/50 py-4 mt-auto">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between text-xs text-muted-foreground">
-          <p>
-            SCS → STL Converter • Direct ZSTD Decompression
-          </p>
-          <p>100% client-side • No data uploaded</p>
+      {/* ──── Footer ──── */}
+      <footer className="border-t border-gray-800/60 bg-[#0a0f1a]/80 mt-auto">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-gray-600">
+          <span>
+            SCS &rarr; STL Converter &middot; Powered by HOOPS Communicator
+          </span>
+          <span>
+            All processing happens locally in your browser. No data is uploaded.
+          </span>
         </div>
       </footer>
     </div>
