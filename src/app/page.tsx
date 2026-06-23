@@ -516,6 +516,25 @@ export default function ScsToStlPage() {
       );
       addLog('Geometry streamed.', 'success');
 
+      // Enable orbit/rotate interaction — HOOPS defaults to Select mode,
+      // but for a preview we want Orbit (left-click drag to rotate).
+      // Operator enum: Navigate=1, Orbit=2, Pan=3, Zoom=4, Select=10
+      try {
+        const view = (hwv as Record<string, unknown>).view;
+        const opMgr =
+          (hwv as Record<string, unknown>).operatorManager ??
+          (view ? (view as Record<string, unknown>).operatorManager : null);
+        if (opMgr && typeof (opMgr as Record<string, unknown>).set === 'function') {
+          // Replace Select (index 1) with Orbit so left-click rotates
+          (opMgr as { set: (op: number, idx: number) => void }).set(2, 1);
+          addLog('Orbit mode enabled.', 'success');
+        } else {
+          addLog('OperatorManager not found — rotation may need manual enable', 'error');
+        }
+      } catch (e) {
+        addLog(`Could not set orbit mode: ${e}`, 'error');
+      }
+
       // Hide all HOOPS UI overlay panels — only keep the canvas visible
       // Small delay to let HOOPS finish rendering its full DOM tree
       await sleep(500);
