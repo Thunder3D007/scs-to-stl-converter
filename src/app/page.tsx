@@ -222,6 +222,7 @@ function hideHoopsUI(container: HTMLElement) {
 async function buildStl(
   model: Record<string, unknown>,
   flipZ: boolean,
+  addLog?: (text: string, level?: LogEntry['level']) => void,
 ): Promise<TriResult> {
   const root =
     typeof model.getAbsoluteRootNode === 'function'
@@ -267,6 +268,7 @@ async function buildStl(
   let triCount = 0;
   let skipped = 0;
 
+  // First pass: count triangles to pre-allocate the buffer
   for (const id of nodes) {
     let mesh: Record<string, unknown> | null = null;
     try {
@@ -275,6 +277,40 @@ async function buildStl(
       )(id)) as Record<string, unknown> | null;
     } catch {
       skipped++;
+      continue;
+    }
+    if (!mesh) continue;
+    const faces = mesh.faces as
+      | (Iterable<{ position: number[]; normal?: number[] }> & {
+          vertexCount?: number;
+        })
+      | undefined;
+    if (!faces || !faces[Symbol.iterator] || !faces.vertexCount) continue;
+    triCount += Math.floor((faces.vertexCount as number) / 3);
+  }
+
+  if (!triCount)
+    throw new Error(
+      'No triangles collected \u2014 model may not have streamed yet',
+    );
+
+  if (addLog) addLog(`Found ${triCount.toLocaleString()} triangles. Building STL...`);
+
+  // Pre-allocate buffer — no intermediate arrays, write directly
+  const buffer = new ArrayBuffer(84 + triCount * 50);
+  const dv = new DataView(buffer);
+  dv.setUint32(80, triCount, true);
+  let off = 84;
+  let written = 0;
+
+  // Second pass: write triangles directly to buffer
+  for (const id of nodes) {
+    let mesh: Record<string, unknown> | null = null;
+    try {
+      mesh = (await (
+        model.getNodeMeshData as (id: unknown) => Promise<Record<string, unknown>>
+      )(id)) as Record<string, unknown> | null;
+    } catch {
       continue;
     }
     if (!mesh) continue;
@@ -329,47 +365,51 @@ async function buildStl(
         const n = a.n
           ? transformDir(m, a.n[0], a.n[1], a.n[2])
           : [0, 0, 0];
+
+        let v0x = p0[0], v0y = p0[1], v0z = p0[2];
+        let v1x = p1[0], v1y = p1[1], v1z = p1[2];
+        let v2x = p2[0], v2y = p2[1], v2z = p2[2];
+
         if (flipZ) {
-          tris.push([
-            n[0], n[1], n[2],
-            p0[0], p0[1], p0[2],
-            p2[0], p2[1], p2[2],
-            p1[0], p1[1], p1[2],
-          ]);
-        } else {
-          tris.push([
-            n[0], n[1], n[2],
-            p0[0], p0[1], p0[2],
-            p1[0], p1[1], p1[2],
-            p2[0], p2[1], p2[2],
-          ]);
+          // Swap v1 and v2 for correct winding
+          [v1x, v2x] = [v2x, v1x];
+          [v1y, v2y] = [v2y, v1y];
+          [v1z, v2z] = [v2z, v1z];
+          n[2] = -n[2];
+          v0z = -v0z; v1z = -v1z; v2z = -v2z;
         }
-        triCount++;
+
+        // Write directly to buffer
+        dv.setFloat32(off, n[0], true); off += 4;
+        dv.setFloat32(off, n[1], true); off += 4;
+        dv.setFloat32(off, n[2], true); off += 4;
+        dv.setFloat32(off, v0x, true); off += 4;
+        dv.setFloat32(off, v0y, true); off += 4;
+        dv.setFloat32(off, v0z, true); off += 4;
+        dv.setFloat32(off, v1x, true); off += 4;
+        dv.setFloat32(off, v1y, true); off += 4;
+        dv.setFloat32(off, v1z, true); off += 4;
+        dv.setFloat32(off, v2x, true); off += 4;
+        dv.setFloat32(off, v2y, true); off += 4;
+        dv.setFloat32(off, v2z, true); off += 4;
+        dv.setUint16(off, 0, true); off += 2;
+        written++;
         buf.length = 0;
       }
+    }
+
+    // Yield to browser every 100 nodes to prevent freezing
+    if (written % 100 === 0) {
+      await new Promise<void>((r) => setTimeout(r, 0));
     }
   }
 
   if (skipped) console.log(`Skipped ${skipped} nodes with errors`);
-  if (!triCount)
-    throw new Error(
-      'No triangles collected \u2014 model may not have streamed yet',
-    );
 
-  // Build binary STL
-  const buffer = new ArrayBuffer(84 + triCount * 50);
-  const dv = new DataView(buffer);
-  dv.setUint32(80, triCount, true);
-  let off = 84;
-  for (const t of tris) {
-    for (let i = 0; i < 12; i++) {
-      dv.setFloat32(off, t[i], true);
-      off += 4;
-    }
-    dv.setUint16(off, 0, true);
-    off += 2;
-  }
-  return { triCount, bytes: buffer };
+  // Update actual triangle count (may differ from estimate)
+  dv.setUint32(80, written, true);
+  const actualBuffer = written === triCount ? buffer : buffer.slice(0, 84 + written * 50);
+  return { triCount: written, bytes: actualBuffer };
 }
 
 /* ------------------------------------------------------------------ */
@@ -646,6 +686,40 @@ export default function ScsToStlPage() {
       freshDiv.setAttribute('data-hoops-viewer', 'true');
       viewerContainerRef.current?.appendChild(freshDiv);
 
+      // Inject CSS to hide HOOPS UI elements BEFORE the viewer mounts.
+      // This prevents the text flash during loading.
+      const styleId = 'hoops-hide-ui-style';
+      let styleEl = document.getElementById(styleId) as HTMLStyleElement | null;
+      if (!styleEl) {
+        styleEl = document.createElement('style');
+        styleEl.id = styleId;
+        styleEl.textContent = `
+          [data-hoops-viewer] > div > div:not(:has(canvas)):not(:has(> canvas)) {
+            display: none !important;
+          }
+          [data-hoops-viewer] canvas {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+          }
+          [data-hoops-viewer] > div > div:has(canvas) {
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            overflow: hidden !important;
+          }
+        `;
+        document.head.appendChild(styleEl);
+      }
+
+      // Also start a MutationObserver to hide new HOOPS UI elements immediately
+      const uiObserver = new MutationObserver(() => hideHoopsUI(freshDiv));
+      uiObserver.observe(freshDiv, { childList: true, subtree: true });
+
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
       blobUrlRef.current = URL.createObjectURL(fileToMount);
 
@@ -812,9 +886,8 @@ export default function ScsToStlPage() {
         // Non-critical — Navigate mode already handles rotation
       }
 
-      // Hide all HOOPS UI overlay panels — only keep the canvas visible
-      // Small delay to let HOOPS finish rendering its full DOM tree
-      await sleep(500);
+      // CSS + MutationObserver already handle hiding HOOPS UI from the start.
+      // Just do one final cleanup pass to catch anything missed.
       hideHoopsUI(freshDiv);
 
       return model as Record<string, unknown>;
@@ -875,7 +948,7 @@ export default function ScsToStlPage() {
     addLog('Starting conversion...');
 
     try {
-      let result = await buildStl(modelRef.current, flipZ);
+      let result = await buildStl(modelRef.current, flipZ, addLog);
       addLog(
         `Raw extraction: ${result.triCount.toLocaleString()} triangles, ${formatBytes(result.bytes.byteLength)}`,
       );
