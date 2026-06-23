@@ -14,9 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SCS → STL Converter | Direct ZSTD 3D Model Converter",
-  description: "Convert HOOPS Stream Cache (.scs) files to STL format with 3D preview. Fast, private, browser-based conversion using direct ZSTD decompression.",
-  keywords: ["SCS to STL", "HOOPS", "3D model converter", "STL converter", "3D printing", "Thangs", "stream cache"],
+  title: "SCS → STL Converter | HOOPS 3D Model Converter",
+  description: "Convert HOOPS Stream Cache (.scs) files to STL format with 3D preview. Fast, private, browser-based conversion.",
+  keywords: ["SCS to STL", "HOOPS", "3D model converter", "STL converter", "3D printing", "stream cache"],
   authors: [{ name: "SCS Converter" }],
   icons: {
     icon: "/favicon.ico",
