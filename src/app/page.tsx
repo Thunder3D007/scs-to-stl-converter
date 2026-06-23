@@ -485,6 +485,7 @@ export default function ScsToStlPage() {
         opts: Record<string, unknown>,
       ) => void)(freshDiv, {
         file: blobUrlRef.current,
+        streamCutoffScale: 0, // Request ALL geometry — no streaming cutoff
         onAction: () => {},
         onError: (e: unknown) => addLog(`Viewer error: ${e}`, 'error'),
       });
@@ -508,13 +509,49 @@ export default function ScsToStlPage() {
         throw new Error('Model surface unrecognized');
       }
 
+      // Wait for initial geometry to appear
       addLog('Streaming geometry...');
       await waitFor(
         () => (modelHasGeometry(model as Record<string, unknown>) ? true : null),
         60000,
         'model geometry',
       );
-      addLog('Geometry streamed.', 'success');
+
+      // Wait for FULL streaming completion before allowing conversion.
+      // SCS is a progressive streaming format — geometry loads in chunks from
+      // low-res to high-res. If we convert too early, we get a partial STL
+      // (e.g. 150MB instead of 700MB). The "streamingDeactivated" callback
+      // fires when HOOPS has finished streaming ALL geometry data.
+      addLog('Waiting for full geometry stream...');
+      try {
+        const streamDone = new Promise<void>((resolve) => {
+          try {
+            if (typeof (hwv as Record<string, unknown>).setCallbacks === 'function') {
+              (hwv as { setCallbacks: (c: Record<string, unknown>) => void }).setCallbacks({
+                streamingActivated: () => addLog('Streaming in progress...'),
+                streamingDeactivated: () => {
+                  addLog('Full geometry stream complete.', 'success');
+                  resolve();
+                },
+              });
+            } else {
+              // setCallbacks not available — resolve immediately
+              resolve();
+            }
+          } catch {
+            resolve();
+          }
+        });
+
+        // Race: wait for streamingDeactivated OR 90 second timeout
+        await Promise.race([
+          streamDone,
+          new Promise<void>((resolve) => setTimeout(resolve, 90000)),
+        ]);
+      } catch {
+        // Non-critical — model geometry is still usable
+      }
+      addLog('Geometry ready for conversion.', 'success');
 
       // Try to set Orbit operator explicitly for best rotation UX.
       // HOOPS defaults to Navigate (which already supports orbit), so this
