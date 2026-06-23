@@ -485,7 +485,6 @@ export default function ScsToStlPage() {
         opts: Record<string, unknown>,
       ) => void)(freshDiv, {
         file: blobUrlRef.current,
-        streamCutoffScale: 0, // Request ALL geometry — no streaming cutoff
         onAction: () => {},
         onError: (e: unknown) => addLog(`Viewer error: ${e}`, 'error'),
       });
@@ -498,6 +497,17 @@ export default function ScsToStlPage() {
         'WebViewer instance',
       );
       addLog('WebViewer found.', 'success');
+
+      // Set streamCutoffScale to 0 = request ALL geometry, no low-res cutoff.
+      // Without this, HOOPS may stop streaming after a low-res version.
+      try {
+        if (typeof (hwv as Record<string, unknown>).setStreamCutoffScale === 'function') {
+          (hwv as { setStreamCutoffScale: (s: number) => Promise<void> }).setStreamCutoffScale(0);
+          addLog('Full geometry streaming requested.');
+        }
+      } catch {
+        // Non-critical
+      }
 
       const model =
         typeof (hwv as Record<string, unknown>).getModel === 'function'
@@ -517,41 +527,82 @@ export default function ScsToStlPage() {
         'model geometry',
       );
 
-      // Wait for FULL streaming completion before allowing conversion.
-      // SCS is a progressive streaming format — geometry loads in chunks from
-      // low-res to high-res. If we convert too early, we get a partial STL
-      // (e.g. 150MB instead of 700MB). The "streamingDeactivated" callback
-      // fires when HOOPS has finished streaming ALL geometry data.
-      addLog('Waiting for full geometry stream...');
-      try {
-        const streamDone = new Promise<void>((resolve) => {
-          try {
-            if (typeof (hwv as Record<string, unknown>).setCallbacks === 'function') {
-              (hwv as { setCallbacks: (c: Record<string, unknown>) => void }).setCallbacks({
-                streamingActivated: () => addLog('Streaming in progress...'),
-                streamingDeactivated: () => {
-                  addLog('Full geometry stream complete.', 'success');
-                  resolve();
-                },
-              });
-            } else {
-              // setCallbacks not available — resolve immediately
-              resolve();
-            }
-          } catch {
-            resolve();
-          }
-        });
+      // Wait for FULL streaming completion.
+      // SCS is a progressive format — geometry loads from low-res to high-res.
+      // Converting too early gives a partial STL (150MB instead of 700MB).
+      // We use two strategies:
+      //   1. Register streamingDeactivated callback (fires when HOOPS finishes)
+      //   2. Poll getModelReady() as a fallback
+      addLog('Waiting for full geometry download...');
+      let streamComplete = false;
 
-        // Race: wait for streamingDeactivated OR 90 second timeout
-        await Promise.race([
-          streamDone,
-          new Promise<void>((resolve) => setTimeout(resolve, 90000)),
-        ]);
+      try {
+        // Strategy 1: Callback-based
+        if (typeof (hwv as Record<string, unknown>).setCallbacks === 'function') {
+          await new Promise<void>((resolve) => {
+            let resolved = false;
+            const done = () => {
+              if (resolved) return;
+              resolved = true;
+              streamComplete = true;
+              resolve();
+            };
+
+            (hwv as { setCallbacks: (c: Record<string, unknown>) => void }).setCallbacks({
+              streamingDeactivated: done,
+              sceneReady: done,
+            });
+
+            // Also poll getModelReady() as fallback in case
+            // streamingDeactivated already fired before we registered
+            const pollInterval = setInterval(() => {
+              try {
+                if (typeof (hwv as Record<string, unknown>).getModelReady === 'function') {
+                  if ((hwv as { getModelReady: () => boolean }).getModelReady()) {
+                    clearInterval(pollInterval);
+                    done();
+                  }
+                }
+              } catch {
+                // ignore
+              }
+            }, 1000);
+
+            // 90 second hard timeout
+            setTimeout(() => {
+              clearInterval(pollInterval);
+              if (!resolved) {
+                resolved = true;
+                addLog('Streaming timeout — converting with available geometry.', 'error');
+                resolve();
+              }
+            }, 90000);
+          });
+        } else {
+          // Strategy 2: Fallback — just poll getModelReady()
+          await waitFor(
+            () => {
+              try {
+                return typeof (hwv as Record<string, unknown>).getModelReady === 'function' &&
+                  (hwv as { getModelReady: () => boolean }).getModelReady()
+                  ? true : null;
+              } catch {
+                return null;
+              }
+            },
+            90000,
+            'full model ready',
+          );
+          streamComplete = true;
+        }
       } catch {
-        // Non-critical — model geometry is still usable
+        // Timeout or error — proceed with what we have
+        addLog('Stream wait timed out — converting with available geometry.', 'error');
       }
-      addLog('Geometry ready for conversion.', 'success');
+
+      if (streamComplete) {
+        addLog('Full geometry ready for conversion.', 'success');
+      }
 
       // Try to set Orbit operator explicitly for best rotation UX.
       // HOOPS defaults to Navigate (which already supports orbit), so this
