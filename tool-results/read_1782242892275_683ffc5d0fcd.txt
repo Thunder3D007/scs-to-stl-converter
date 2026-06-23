@@ -1,0 +1,810 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import React, { useState, useRef, useCallback, useEffect } from "react";
+     4→     4→import {
+     5→     5→  Upload,
+     6→     6→  Download,
+     7→     7→  Box,
+     8→     8→  Settings2,
+     9→     9→  RotateCcw,
+    10→    10→  CheckCircle2,
+    11→    11→  AlertCircle,
+    12→    12→  Loader2,
+    13→    13→  FileBox,
+    14→    14→  Zap,
+    15→    15→  Eye,
+    16→    16→  FlipVertical,
+    17→    17→} from "lucide-react";
+    18→    18→
+    19→    19→/* ─── types ─── */
+    20→    20→interface TriResult {
+    21→    21→  triCount: number;
+    22→    22→  bytes: ArrayBuffer;
+    23→    23→}
+    24→    24→
+    25→    25→interface ConvertLog {
+    26→    26→  time: string;
+    27→    27→  msg: string;
+    28→    28→  type: "info" | "success" | "error";
+    29→    29→}
+    30→    30→
+    31→    31→/* ─── helpers ─── */
+    32→    32→function logMsg(msg: string, type: ConvertLog["type"] = "info"): ConvertLog {
+    33→    33→  return { time: new Date().toLocaleTimeString(), msg, type };
+    34→    34→}
+    35→    35→
+    36→    36→function formatBytes(b: number): string {
+    37→    37→  if (b < 1024) return `${b} B`;
+    38→    38→  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+    39→    39→  return `${(b / 1048576).toFixed(2)} MB`;
+    40→    40→}
+    41→    41→
+    42→    42→function triggerDownload(data: ArrayBuffer, name: string) {
+    43→    43→  const blob = new Blob([data], { type: "application/octet-stream" });
+    44→    44→  const a = document.createElement("a");
+    45→    45→  a.href = URL.createObjectURL(blob);
+    46→    46→  a.download = name;
+    47→    47→  document.body.appendChild(a);
+    48→    48→  a.click();
+    49→    49→  a.remove();
+    50→    50→  setTimeout(() => URL.revokeObjectURL(a.href), 0);
+    51→    51→}
+    52→    52→
+    53→    53→/* ─── safe wrapper ─── */
+    54→    54→function safe<T>(fn: () => T): T | undefined {
+    55→    55→  try {
+    56→    56→    return fn();
+    57→    57→  } catch {
+    58→    58→    return undefined;
+    59→    59→  }
+    60→    60→}
+    61→    61→
+    62→    62→/* ─── HOOPS detection helpers ─── */
+    63→    63→function looksLikeViewer(v: unknown): boolean {
+    64→    64→  if (!v || typeof v !== "object") return false;
+    65→    65→  const m =
+    66→    66→    safe(() => (v as Record<string, unknown>).model) ??
+    67→    67→    safe(() =>
+    68→    68→      typeof (v as Record<string, unknown>).getModel === "function"
+    69→    69→        ? (v as Record<string, { getModel: () => unknown }>).getModel()
+    70→    70→        : undefined
+    71→    71→    );
+    72→    72→  return !!(
+    73→    73→    m &&
+    74→    74→    typeof (m as Record<string, unknown>).getNodeChildren === "function"
+    75→    75→  );
+    76→    76→}
+    77→    77→
+    78→    78→function findWebViewer(rootEl: HTMLElement): unknown {
+    79→    79→  const seen = new WeakSet();
+    80→    80→  function walkFiber(fiber: unknown, depth: number): unknown {
+    81→    81→    if (!fiber || depth > 200 || seen.has(fiber as object)) return null;
+    82→    82→    seen.add(fiber as object);
+    83→    83→    for (const key of [
+    84→    84→      "stateNode",
+    85→    85→      "memoizedState",
+    86→    86→      "memoizedProps",
+    87→    87→      "ref",
+    88→    88→    ] as const) {
+    89→    89→      const v = safe(() => (fiber as Record<string, unknown>)[key]);
+    90→    90→      if (looksLikeViewer(v)) return v;
+    91→    91→      if (v && typeof v === "object") {
+    92→    92→        const cur = safe(() => (v as { current?: unknown }).current);
+    93→    93→        if (looksLikeViewer(cur)) return cur;
+    94→    94→        let h = v as Record<string, unknown>;
+    95→    95→        for (let i = 0; i < 80 && h; i++) {
+    96→    96→          if (looksLikeViewer(h)) return h;
+    97→    97→          const hc = safe(() => (h as { current?: unknown }).current);
+    98→    98→          if (looksLikeViewer(hc)) return hc;
+    99→    99→          for (const k of ["baseState", "memoizedState"] as const) {
+   100→   100→            const inner = safe(() => (h as Record<string, unknown>)[k]);
+   101→   101→            if (looksLikeViewer(inner)) return inner;
+   102→   102→          }
+   103→   103→          h = safe(() => (h as { next?: unknown }).next) as Record<
+   104→   104→            string,
+   105→   105→            unknown
+   106→   106→          >;
+   107→   107→        }
+   108→   108→      }
+   109→   109→    }
+   110→   110→    return (
+   111→   111→      walkFiber(
+   112→   112→        safe(() => (fiber as { child?: unknown }).child),
+   113→   113→        depth + 1
+   114→   114→      ) ??
+   115→   115→      walkFiber(
+   116→   116→        safe(() => (fiber as { sibling?: unknown }).sibling),
+   117→   117→        depth + 1
+   118→   118→      )
+   119→   119→    );
+   120→   120→  }
+   121→   121→
+   122→   122→  const stack = [rootEl];
+   123→   123→  while (stack.length) {
+   124→   124→    const el = stack.pop()!;
+   125→   125→    const props = safe(() => Object.getOwnPropertyNames(el)) ?? [];
+   126→   126→    for (const p of props) {
+   127→   127→      if (
+   128→   128→        !p.startsWith("__reactFiber") &&
+   129→   129→        !p.startsWith("__reactInternalInstance")
+   130→   130→      )
+   131→   131→        continue;
+   132→   132→      const found = walkFiber(safe(() => (el as Record<string, unknown>)[p]), 0);
+   133→   133→      if (found) return found;
+   134→   134→    }
+   135→   135→    for (const c of Array.from(el.children)) stack.push(c);
+   136→   136→  }
+   137→   137→  return null;
+   138→   138→}
+   139→   139→
+   140→   140→function modelHasGeometry(model: Record<string, unknown>): boolean {
+   141→   141→  try {
+   142→   142→    const root =
+   143→   143→      typeof model.getAbsoluteRootNode === "function"
+   144→   144→        ? (model.getAbsoluteRootNode as () => unknown)()
+   145→   145→        : typeof model.getRootNode === "function"
+   146→   146→          ? (model.getRootNode as () => unknown)()
+   147→   147→          : null;
+   148→   148→    const kids =
+   149→   149→      typeof model.getNodeChildren === "function"
+   150→   150→        ? (model.getNodeChildren as (n: unknown) => unknown[])(root)
+   151→   151→        : [];
+   152→   152→    return Array.isArray(kids) && kids.length > 0;
+   153→   153→  } catch {
+   154→   154→    return false;
+   155→   155→  }
+   156→   156→}
+   157→   157→
+   158→   158→/* ─── polling ─── */
+   159→   159→function sleep(ms: number) {
+   160→   160→  return new Promise((r) => setTimeout(r, ms));
+   161→   161→}
+   162→   162→
+   163→   163→async function waitFor<T>(
+   164→   164→  check: () => T | null,
+   165→   165→  timeoutMs: number,
+   166→   166→  label: string
+   167→   167→): Promise<T> {
+   168→   168→  const start = Date.now();
+   169→   169→  while (Date.now() - start < timeoutMs) {
+   170→   170→    const v = check();
+   171→   171→    if (v) return v;
+   172→   172→    await sleep(150);
+   173→   173→  }
+   174→   174→  throw new Error(`Timed out waiting for ${label} (${timeoutMs}ms)`);
+   175→   175→}
+   176→   176→
+   177→   177→/* ─── main page ─── */
+   178→   178→export default function SCSConverter() {
+   179→   179→  const [logs, setLogs] = useState<ConvertLog[]>([]);
+   180→   180→  const [file, setFile] = useState<File | null>(null);
+   181→   181→  const [converting, setConverting] = useState(false);
+   182→   182→  const [loading, setLoading] = useState(false);
+   183→   183→  const [modelReady, setModelReady] = useState(false);
+   184→   184→  const [flipZ, setFlipZ] = useState(true);
+   185→   185→  const [result, setResult] = useState<TriResult | null>(null);
+   186→   186→  const viewerRef = useRef<HTMLDivElement>(null);
+   187→   187→  const mountedRef = useRef(false);
+   188→   188→  const blobUrlRef = useRef<string | null>(null);
+   189→   189→
+   190→   190→  const addLog = useCallback((msg: string, type: ConvertLog["type"] = "info") => {
+   191→   191→    setLogs((prev) => [...prev, logMsg(msg, type)]);
+   192→   192→  }, []);
+   193→   193→
+   194→   194→  /* ─── load HOOPS bundle ─── */
+   195→   195→  useEffect(() => {
+   196→   196→    if (document.getElementById("hoops-bundle")) return;
+   197→   197→    const script = document.createElement("script");
+   198→   198→    script.id = "hoops-bundle";
+   199→   199→    script.src = "/hoops/bundle.js";
+   200→   200→    script.async = true;
+   201→   201→    document.head.appendChild(script);
+   202→   202→  }, []);
+   203→   203→
+   204→   204→  /* ─── mount viewer ─── */
+   205→   205→  const mountAndWait = useCallback(async () => {
+   206→   206→    const GcHoopsViewer = (window as Record<string, unknown>)
+   207→   207→      .GcHoopsViewer as Record<string, unknown> | undefined;
+   208→   208→    if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== "function") {
+   209→   209→      throw new Error("HOOPS Viewer bundle did not load");
+   210→   210→    }
+   211→   211→
+   212→   212→    if (mountedRef.current) {
+   213→   213→      try {
+   214→   214→        (GcHoopsViewer.unmountViewer as () => void)();
+   215→   215→      } catch {}
+   216→   216→      mountedRef.current = false;
+   217→   217→    }
+   218→   218→    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+   219→   219→    blobUrlRef.current = URL.createObjectURL(file!);
+   220→   220→
+   221→   221→    addLog("Loading 3D viewer...");
+   222→   222→    (GcHoopsViewer.mountViewer as (
+   223→   223→      el: HTMLElement,
+   224→   224→      opts: Record<string, unknown>
+   225→   225→    ) => void)(viewerRef.current!, {
+   226→   226→      file: blobUrlRef.current,
+   227→   227→      onAction: () => {},
+   228→   228→      onError: (e: unknown) => addLog(`Viewer error: ${e}`, "error"),
+   229→   229→    });
+   230→   230→    mountedRef.current = true;
+   231→   231→
+   232→   232→    addLog("Waiting for WebViewer...");
+   233→   233→    const hwv = await waitFor(
+   234→   234→      () => findWebViewer(viewerRef.current!) as Record<string, unknown> | null,
+   235→   235→      20000,
+   236→   236→      "WebViewer instance"
+   237→   237→    );
+   238→   238→    addLog("WebViewer found.");
+   239→   239→
+   240→   240→    const model =
+   241→   241→      typeof (hwv as Record<string, unknown>).getModel === "function"
+   242→   242→        ? ((hwv as { getModel: () => unknown }).getModel() as Record<
+   243→   243→            string,
+   244→   244→            unknown
+   245→   245→          >)
+   246→   246→        : (hwv as Record<string, unknown>).model;
+   247→   247→    if (!model || typeof model.getNodeChildren !== "function") {
+   248→   248→      throw new Error("Model surface unrecognized");
+   249→   249→    }
+   250→   250→
+   251→   251→    addLog("Streaming geometry...");
+   252→   252→    await waitFor(
+   253→   253→      () => (modelHasGeometry(model) ? true : null),
+   254→   254→      60000,
+   255→   255→      "model geometry"
+   256→   256→    );
+   257→   257→    return model;
+   258→   258→  }, [file, addLog]);
+   259→   259→
+   260→   260→  /* ─── build STL ─── */
+   261→   261→  const buildStl = useCallback(
+   262→   262→    async (
+   263→   263→      model: Record<string, unknown>,
+   264→   264→      shouldFlipZ: boolean
+   265→   265→    ): Promise<TriResult> => {
+   266→   266→      const root =
+   267→   267→        typeof model.getAbsoluteRootNode === "function"
+   268→   268→          ? (model.getAbsoluteRootNode as () => unknown)()
+   269→   269→          : (model.getRootNode as () => unknown)();
+   270→   270→      const nodes = (model.getNodeChildren as (n: unknown) => unknown[])(root);
+   271→   271→
+   272→   272→      const transform = (
+   273→   273→        m: number[],
+   274→   274→        x: number,
+   275→   275→        y: number,
+   276→   276→        z: number
+   277→   277→      ): number[] => {
+   278→   278→        const o = [
+   279→   279→          m[0] * x + m[4] * y + m[8] * z + m[12],
+   280→   280→          m[1] * x + m[5] * y + m[9] * z + m[13],
+   281→   281→          m[2] * x + m[6] * y + m[10] * z + m[14],
+   282→   282→        ];
+   283→   283→        if (shouldFlipZ) o[2] = -o[2];
+   284→   284→        return o;
+   285→   285→      };
+   286→   286→
+   287→   287→      const transformDir = (
+   288→   288→        m: number[],
+   289→   289→        x: number,
+   290→   290→        y: number,
+   291→   291→        z: number
+   292→   292→      ): number[] => {
+   293→   293→        const o = [
+   294→   294→          m[0] * x + m[4] * y + m[8] * z,
+   295→   295→          m[1] * x + m[5] * y + m[9] * z,
+   296→   296→          m[2] * x + m[6] * y + m[10] * z,
+   297→   297→        ];
+   298→   298→        if (shouldFlipZ) o[2] = -o[2];
+   299→   299→        return o;
+   300→   300→      };
+   301→   301→
+   302→   302→      const tris: number[][] = [];
+   303→   303→      let triCount = 0;
+   304→   304→      let skipped = 0;
+   305→   305→
+   306→   306→      for (const id of nodes) {
+   307→   307→        let mesh: Record<string, unknown> | null = null;
+   308→   308→        try {
+   309→   309→          mesh = (await (model.getNodeMeshData as (id: unknown) => Promise<
+   310→   310→            Record<string, unknown>
+   311→   311→          >)(id)) as Record<string, unknown> | null;
+   312→   312→        } catch {
+   313→   313→          skipped++;
+   314→   314→          continue;
+   315→   315→        }
+   316→   316→        if (!mesh) continue;
+   317→   317→        const faces = mesh.faces as
+   318→   318→          | (Iterable<{ position: number[]; normal?: number[] }> & {
+   319→   319→              vertexCount?: number;
+   320→   320→            })
+   321→   321→          | undefined;
+   322→   322→        if (!faces || !faces[Symbol.iterator] || !faces.vertexCount) continue;
+   323→   323→
+   324→   324→        let matObj: unknown = null;
+   325→   325→        try {
+   326→   326→          if (typeof model.getNodeNetMatrix === "function")
+   327→   327→            matObj = (model.getNodeNetMatrix as (id: unknown) => unknown)(id);
+   328→   328→          else if (typeof model.getNetMatrix === "function")
+   329→   329→            matObj = (model.getNetMatrix as (id: unknown) => unknown)(id);
+   330→   330→          if (matObj && typeof (matObj as Promise<unknown>).then === "function")
+   331→   331→            matObj = await matObj;
+   332→   332→        } catch {
+   333→   333→          matObj = null;
+   334→   334→        }
+   335→   335→
+   336→   336→        let m: number[];
+   337→   337→        if (Array.isArray(matObj) && matObj.length === 16) m = matObj;
+   338→   338→        else if (
+   339→   339→          matObj &&
+   340→   340→          Array.isArray((matObj as { m?: number[] }).m) &&
+   341→   341→          (matObj as { m?: number[] }).m!.length === 16
+   342→   342→        )
+   343→   343→          m = (matObj as { m: number[] }).m;
+   344→   344→        else if (
+   345→   345→          matObj &&
+   346→   346→          typeof (matObj as { getElements?: () => number[] }).getElements ===
+   347→   347→            "function"
+   348→   348→        )
+   349→   349→          m = (matObj as { getElements: () => number[] }).getElements();
+   350→   350→        else m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+   351→   351→
+   352→   352→        const buf: { p: number[]; n: number[] | null }[] = [];
+   353→   353→        for (const v of faces) {
+   354→   354→          buf.push({
+   355→   355→            p: [v.position[0], v.position[1], v.position[2]],
+   356→   356→            n: v.normal
+   357→   357→              ? [v.normal[0], v.normal[1], v.normal[2]]
+   358→   358→              : null,
+   359→   359→          });
+   360→   360→          if (buf.length === 3) {
+   361→   361→            const [a, b, c] = buf;
+   362→   362→            const p0 = transform(m, a.p[0], a.p[1], a.p[2]);
+   363→   363→            const p1 = transform(m, b.p[0], b.p[1], b.p[2]);
+   364→   364→            const p2 = transform(m, c.p[0], c.p[1], c.p[2]);
+   365→   365→            const n = a.n
+   366→   366→              ? transformDir(m, a.n[0], a.n[1], a.n[2])
+   367→   367→              : [0, 0, 0];
+   368→   368→            if (shouldFlipZ) {
+   369→   369→              tris.push([
+   370→   370→                n[0], n[1], n[2],
+   371→   371→                p0[0], p0[1], p0[2],
+   372→   372→                p2[0], p2[1], p2[2],
+   373→   373→                p1[0], p1[1], p1[2],
+   374→   374→              ]);
+   375→   375→            } else {
+   376→   376→              tris.push([
+   377→   377→                n[0], n[1], n[2],
+   378→   378→                p0[0], p0[1], p0[2],
+   379→   379→                p1[0], p1[1], p1[2],
+   380→   380→                p2[0], p2[1], p2[2],
+   381→   381→              ]);
+   382→   382→            }
+   383→   383→            triCount++;
+   384→   384→            buf.length = 0;
+   385→   385→          }
+   386→   386→        }
+   387→   387→      }
+   388→   388→
+   389→   389→      if (skipped) addLog(`Skipped ${skipped} nodes with errors`, "error");
+   390→   390→      if (!triCount) throw new Error("No triangles collected");
+   391→   391→
+   392→   392→      /* binary STL */
+   393→   393→      const buffer = new ArrayBuffer(84 + triCount * 50);
+   394→   394→      const dv = new DataView(buffer);
+   395→   395→      dv.setUint32(80, triCount, true);
+   396→   396→      let off = 84;
+   397→   397→      for (const t of tris) {
+   398→   398→        for (let i = 0; i < 12; i++) dv.setFloat32(off + i * 4, t[i], true);
+   399→   399→        off += 48;
+   400→   400→        dv.setUint16(off, 0, true);
+   401→   401→        off += 2;
+   402→   402→      }
+   403→   403→
+   404→   404→      return { triCount, bytes: buffer };
+   405→   405→    },
+   406→   406→    [addLog]
+   407→   407→  );
+   408→   408→
+   409→   409→  /* ─── file handler ─── */
+   410→   410→  const handleFile = useCallback(
+   411→   411→    async (f: File) => {
+   412→   412→      if (!f.name.toLowerCase().endsWith(".scs")) {
+   413→   413→        addLog("Please select an .scs file", "error");
+   414→   414→        return;
+   415→   415→      }
+   416→   416→      setFile(f);
+   417→   417→      setResult(null);
+   418→   418→      setModelReady(false);
+   419→   419→      setLogs([logMsg(`Selected: ${f.name} (${formatBytes(f.size)})`)]);
+   420→   420→      setLoading(true);
+   421→   421→
+   422→   422→      try {
+   423→   423→        const model = await mountAndWait();
+   424→   424→        addLog("Model loaded — ready to convert", "success");
+   425→   425→        setModelReady(true);
+   426→   426→      } catch (e) {
+   427→   427→        addLog(
+   428→   428→          `Preview failed: ${e instanceof Error ? e.message : String(e)}`,
+   429→   429→          "error"
+   430→   430→        );
+   431→   431→      } finally {
+   432→   432→        setLoading(false);
+   433→   433→      }
+   434→   434→    },
+   435→   435→    [mountAndWait, addLog]
+   436→   436→  );
+   437→   437→
+   438→   438→  /* ─── convert ─── */
+   439→   439→  const handleConvert = useCallback(async () => {
+   440→   440→    if (!file) return;
+   441→   441→    setConverting(true);
+   442→   442→    setResult(null);
+   443→   443→    addLog("Starting conversion...");
+   444→   444→
+   445→   445→    try {
+   446→   446→      const model = await mountAndWait();
+   447→   447→      await sleep(750);
+   448→   448→      addLog("Extracting mesh data...");
+   449→   449→      const stl = await buildStl(model, flipZ);
+   450→   450→      setResult(stl);
+   451→   451→      addLog(
+   452→   452→        `Built STL: ${stl.triCount.toLocaleString()} triangles, ${formatBytes(stl.bytes.byteLength)}`,
+   453→   453→        "success"
+   454→   454→      );
+   455→   455→    } catch (e) {
+   456→   456→      addLog(
+   457→   457→        `Conversion failed: ${e instanceof Error ? e.message : String(e)}`,
+   458→   458→        "error"
+   459→   459→      );
+   460→   460→    } finally {
+   461→   461→      setConverting(false);
+   462→   462→    }
+   463→   463→  }, [file, flipZ, mountAndWait, buildStl, addLog]);
+   464→   464→
+   465→   465→  /* ─── download ─── */
+   466→   466→  const handleDownload = useCallback(() => {
+   467→   467→    if (!result || !file) return;
+   468→   468→    const name = file.name.replace(/\.scs$/i, "") + ".stl";
+   469→   469→    triggerDownload(result.bytes, name);
+   470→   470→    addLog(`Downloaded ${name}`, "success");
+   471→   471→  }, [result, file, addLog]);
+   472→   472→
+   473→   473→  /* ─── reset ─── */
+   474→   474→  const handleReset = useCallback(() => {
+   475→   475→    setFile(null);
+   476→   476→    setResult(null);
+   477→   477→    setModelReady(false);
+   478→   478→    setLoading(false);
+   479→   479→    setConverting(false);
+   480→   480→    setLogs([]);
+   481→   481→    if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+   482→   482→    blobUrlRef.current = null;
+   483→   483→    mountedRef.current = false;
+   484→   484→  }, []);
+   485→   485→
+   486→   486→  /* ─── drag & drop ─── */
+   487→   487→  const handleDrop = useCallback(
+   488→   488→    (e: React.DragEvent) => {
+   489→   489→      e.preventDefault();
+   490→   490→      e.stopPropagation();
+   491→   491→      const f = e.dataTransfer.files[0];
+   492→   492→      if (f) handleFile(f);
+   493→   493→    },
+   494→   494→    [handleFile]
+   495→   495→  );
+   496→   496→
+   497→   497→  const handleDragOver = useCallback((e: React.DragEvent) => {
+   498→   498→    e.preventDefault();
+   499→   499→    e.stopPropagation();
+   500→   500→  }, []);
+   501→   501→
+   502→   502→  return (
+   503→   503→    <div className="min-h-screen flex flex-col bg-background">
+   504→   504→      {/* Header */}
+   505→   505→      <header className="border-b border-border/50 bg-card/50 backdrop-blur-sm sticky top-0 z-50">
+   506→   506→        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+   507→   507→          <div className="flex items-center gap-3">
+   508→   508→            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+   509→   509→              <Box className="w-5 h-5 text-white" />
+   510→   510→            </div>
+   511→   511→            <div>
+   512→   512→              <h1 className="text-lg font-bold tracking-tight">
+   513→   513→                SCS → STL Converter
+   514→   514→              </h1>
+   515→   515→              <p className="text-xs text-muted-foreground">
+   516→   516→                Powered by HOOPS Communicator Engine
+   517→   517→              </p>
+   518→   518→            </div>
+   519→   519→          </div>
+   520→   520→          {file && (
+   521→   521→            <button
+   522→   522→              onClick={handleReset}
+   523→   523→              className="flex items-center gap-2 px-3 py-2 text-sm rounded-lg border border-border hover:bg-accent transition-colors"
+   524→   524→            >
+   525→   525→              <RotateCcw className="w-3.5 h-3.5" />
+   526→   526→              Reset
+   527→   527→            </button>
+   528→   528→          )}
+   529→   529→        </div>
+   530→   530→      </header>
+   531→   531→
+   532→   532→      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 py-6">
+   533→   533→        {!file ? (
+   534→   534→          /* ─── Upload Zone ─── */
+   535→   535→          <div className="flex items-center justify-center min-h-[70vh]">
+   536→   536→            <div
+   537→   537→              onDrop={handleDrop}
+   538→   538→              onDragOver={handleDragOver}
+   539→   539→              className="w-full max-w-2xl"
+   540→   540→            >
+   541→   541→              <div
+   542→   542→                className="border-2 border-dashed border-border rounded-2xl p-12 text-center hover:border-emerald-500/50 hover:bg-emerald-500/5 transition-all duration-300 cursor-pointer group"
+   543→   543→                onClick={() =>
+   544→   544→                  document.getElementById("scs-file-input")?.click()
+   545→   545→                }
+   546→   546→              >
+   547→   547→                <div className="w-20 h-20 mx-auto rounded-2xl bg-gradient-to-br from-emerald-500/10 to-teal-500/10 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
+   548→   548→                  <Upload className="w-9 h-9 text-emerald-500" />
+   549→   549→                </div>
+   550→   550→                <h2 className="text-xl font-semibold mb-2">
+   551→   551→                  Drop your .scs file here
+   552→   552→                </h2>
+   553→   553→                <p className="text-muted-foreground text-sm mb-6">
+   554→   554→                  or click to browse — supports HOOPS Stream Cache format
+   555→   555→                </p>
+   556→   556→                <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 text-emerald-600 text-sm font-medium">
+   557→   557→                  <Zap className="w-3.5 h-3.5" />
+   558→   558→                  100% browser-based, no upload to server
+   559→   559→                </div>
+   560→   560→                <input
+   561→   561→                  id="scs-file-input"
+   562→   562→                  type="file"
+   563→   563→                  accept=".scs"
+   564→   564→                  className="hidden"
+   565→   565→                  onChange={(e) =>
+   566→   566→                    e.target.files?.[0] && handleFile(e.target.files[0])
+   567→   567→                  }
+   568→   568→                />
+   569→   569→              </div>
+   570→   570→
+   571→   571→              {/* Features */}
+   572→   572→              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-8">
+   573→   573→                {[
+   574→   574→                  {
+   575→   575→                    icon: Eye,
+   576→   576→                    title: "3D Preview",
+   577→   577→                    desc: "Visualize your model before converting",
+   578→   578→                  },
+   579→   579→                  {
+   580→   580→                    icon: Zap,
+   581→   581→                    title: "Exact Geometry",
+   582→   582→                    desc: "Uses official HOOPS engine for perfect mesh",
+   583→   583→                  },
+   584→   584→                  {
+   585→   585→                    icon: FlipVertical,
+   586→   586→                    title: "Z-Flip Fix",
+   587→   587→                    desc: "Automatic Z-axis correction for slicers",
+   588→   588→                  },
+   589→   589→                ].map((feat) => (
+   590→   590→                  <div
+   591→   591→                    key={feat.title}
+   592→   592→                    className="flex items-start gap-3 p-4 rounded-xl border border-border/50 bg-card/50"
+   593→   593→                  >
+   594→   594→                    <feat.icon className="w-5 h-5 text-emerald-500 mt-0.5 shrink-0" />
+   595→   595→                    <div>
+   596→   596→                      <p className="text-sm font-medium">{feat.title}</p>
+   597→   597→                      <p className="text-xs text-muted-foreground">
+   598→   598→                        {feat.desc}
+   599→   599→                      </p>
+   600→   600→                    </div>
+   601→   601→                  </div>
+   602→   602→                ))}
+   603→   603→              </div>
+   604→   604→            </div>
+   605→   605→          </div>
+   606→   606→        ) : (
+   607→   607→          /* ─── Workspace ─── */
+   608→   608→          <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-6 min-h-[70vh]">
+   609→   609→            {/* Left Panel */}
+   610→   610→            <div className="flex flex-col gap-4 order-2 lg:order-1">
+   611→   611→              {/* File Info Card */}
+   612→   612→              <div className="rounded-xl border border-border/50 bg-card/80 p-5">
+   613→   613→                <div className="flex items-center gap-3 mb-4">
+   614→   614→                  <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+   615→   615→                    <FileBox className="w-5 h-5 text-emerald-500" />
+   616→   616→                  </div>
+   617→   617→                  <div className="min-w-0 flex-1">
+   618→   618→                    <p className="font-medium text-sm truncate">{file.name}</p>
+   619→   619→                    <p className="text-xs text-muted-foreground">
+   620→   620→                      {formatBytes(file.size)}
+   621→   621→                    </p>
+   622→   622→                  </div>
+   623→   623→                  {modelReady && (
+   624→   624→                    <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
+   625→   625→                  )}
+   626→   626→                </div>
+   627→   627→
+   628→   628→                {/* Settings */}
+   629→   629→                <div className="space-y-3 pt-3 border-t border-border/50">
+   630→   630→                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider flex items-center gap-2">
+   631→   631→                    <Settings2 className="w-3.5 h-3.5" />
+   632→   632→                    Settings
+   633→   633→                  </p>
+   634→   634→                  <label className="flex items-center gap-3 cursor-pointer group">
+   635→   635→                    <div className="relative">
+   636→   636→                      <input
+   637→   637→                        type="checkbox"
+   638→   638→                        checked={flipZ}
+   639→   639→                        onChange={(e) => setFlipZ(e.target.checked)}
+   640→   640→                        className="sr-only peer"
+   641→   641→                      />
+   642→   642→                      <div className="w-9 h-5 rounded-full bg-muted peer-checked:bg-emerald-500 transition-colors" />
+   643→   643→                      <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform peer-checked:translate-x-4" />
+   644→   644→                    </div>
+   645→   645→                    <div>
+   646→   646→                      <p className="text-sm font-medium">Flip Z Axis</p>
+   647→   647→                      <p className="text-xs text-muted-foreground">
+   648→   648→                        Fix Y-up → Z-up for slicers
+   649→   649→                      </p>
+   650→   650→                    </div>
+   651→   651→                  </label>
+   652→   652→                </div>
+   653→   653→              </div>
+   654→   654→
+   655→   655→              {/* Action Buttons */}
+   656→   656→              <div className="flex flex-col gap-2">
+   657→   657→                <button
+   658→   658→                  onClick={handleConvert}
+   659→   659→                  disabled={!modelReady || converting}
+   660→   660→                  className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-medium shadow-lg shadow-emerald-500/20 hover:shadow-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+   661→   661→                >
+   662→   662→                  {converting ? (
+   663→   663→                    <>
+   664→   664→                      <Loader2 className="w-4 h-4 animate-spin" />
+   665→   665→                      Converting...
+   666→   666→                    </>
+   667→   667→                  ) : (
+   668→   668→                    <>
+   669→   669→                      <Zap className="w-4 h-4" />
+   670→   670→                      Convert to STL
+   671→   671→                    </>
+   672→   672→                  )}
+   673→   673→                </button>
+   674→   674→
+   675→   675→                {result && (
+   676→   676→                  <button
+   677→   677→                    onClick={handleDownload}
+   678→   678→                    className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl border-2 border-emerald-500/30 text-emerald-600 font-medium hover:bg-emerald-500/10 transition-all"
+   679→   679→                  >
+   680→   680→                    <Download className="w-4 h-4" />
+   681→   681→                    Download STL ({formatBytes(result.bytes.byteLength)})
+   682→   682→                  </button>
+   683→   683→                )}
+   684→   684→              </div>
+   685→   685→
+   686→   686→              {/* Result Card */}
+   687→   687→              {result && (
+   688→   688→                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-5">
+   689→   689→                  <div className="flex items-center gap-2 mb-3">
+   690→   690→                    <CheckCircle2 className="w-5 h-5 text-emerald-500" />
+   691→   691→                    <p className="font-semibold text-emerald-600">
+   692→   692→                      Conversion Successful
+   693→   693→                    </p>
+   694→   694→                  </div>
+   695→   695→                  <div className="grid grid-cols-2 gap-3 text-sm">
+   696→   696→                    <div>
+   697→   697→                      <p className="text-muted-foreground text-xs">
+   698→   698→                        Triangles
+   699→   699→                      </p>
+   700→   700→                      <p className="font-mono font-medium">
+   701→   701→                        {result.triCount.toLocaleString()}
+   702→   702→                      </p>
+   703→   703→                    </div>
+   704→   704→                    <div>
+   705→   705→                      <p className="text-muted-foreground text-xs">STL Size</p>
+   706→   706→                      <p className="font-mono font-medium">
+   707→   707→                        {formatBytes(result.bytes.byteLength)}
+   708→   708→                      </p>
+   709→   709→                    </div>
+   710→   710→                  </div>
+   711→   711→                </div>
+   712→   712→              )}
+   713→   713→
+   714→   714→              {/* Log */}
+   715→   715→              <div className="rounded-xl border border-border/50 bg-card/50 flex-1 min-h-[200px] overflow-hidden flex flex-col">
+   716→   716→                <div className="px-4 py-2 border-b border-border/50 flex items-center justify-between">
+   717→   717→                  <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+   718→   718→                    Log
+   719→   719→                  </p>
+   720→   720→                  {logs.length > 0 && (
+   721→   721→                    <button
+   722→   722→                      onClick={() => setLogs([])}
+   723→   723→                      className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+   724→   724→                    >
+   725→   725→                      Clear
+   726→   726→                    </button>
+   727→   727→                  )}
+   728→   728→                </div>
+   729→   729→                <div className="p-3 font-mono text-xs space-y-1 overflow-y-auto max-h-[300px]">
+   730→   730→                  {logs.length === 0 && (
+   731→   731→                    <p className="text-muted-foreground">
+   732→   732→                      Waiting for activity...
+   733→   733→                    </p>
+   734→   734→                  )}
+   735→   735→                  {logs.map((l, i) => (
+   736→   736→                    <div
+   737→   737→                      key={i}
+   738→   738→                      className={`flex gap-2 ${
+   739→   739→                        l.type === "error"
+   740→   740→                          ? "text-red-400"
+   741→   741→                          : l.type === "success"
+   742→   742→                            ? "text-emerald-400"
+   743→   743→                            : "text-muted-foreground"
+   744→   744→                      }`}
+   745→   745→                    >
+   746→   746→                      <span className="text-muted-foreground/50 shrink-0">
+   747→   747→                        {l.time}
+   748→   748→                      </span>
+   749→   749→                      <span>{l.msg}</span>
+   750→   750→                    </div>
+   751→   751→                  ))}
+   752→   752→                  {(loading || converting) && (
+   753→   753→                    <div className="flex items-center gap-2 text-emerald-400">
+   754→   754→                      <Loader2 className="w-3 h-3 animate-spin" />
+   755→   755→                      <span>Processing...</span>
+   756→   756→                    </div>
+   757→   757→                  )}
+   758→   758→                </div>
+   759→   759→              </div>
+   760→   760→            </div>
+   761→   761→
+   762→   762→            {/* Right Panel - 3D Viewer */}
+   763→   763→            <div className="order-1 lg:order-2">
+   764→   764→              <div className="rounded-xl border border-border/50 bg-card/50 overflow-hidden h-full min-h-[400px] relative">
+   765→   765→                <div className="absolute top-3 left-3 z-10 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm text-xs text-white/80">
+   766→   766→                  <Eye className="w-3.5 h-3.5" />
+   767→   767→                  3D Preview
+   768→   768→                </div>
+   769→   769→                {!modelReady && !loading && (
+   770→   770→                  <div className="flex items-center justify-center h-full text-muted-foreground">
+   771→   771→                    <div className="text-center">
+   772→   772→                      <Box className="w-12 h-12 mx-auto mb-3 opacity-20" />
+   773→   773→                      <p className="text-sm">Preview will appear here</p>
+   774→   774→                    </div>
+   775→   775→                  </div>
+   776→   776→                )}
+   777→   777→                {loading && (
+   778→   778→                  <div className="flex items-center justify-center h-full">
+   779→   779→                    <div className="text-center">
+   780→   780→                      <Loader2 className="w-8 h-8 mx-auto mb-3 animate-spin text-emerald-500" />
+   781→   781→                      <p className="text-sm text-muted-foreground">
+   782→   782→                        Loading 3D viewer...
+   783→   783→                      </p>
+   784→   784→                    </div>
+   785→   785→                  </div>
+   786→   786→                )}
+   787→   787→                <div
+   788→   788→                  ref={viewerRef}
+   789→   789→                  className="w-full h-full"
+   790→   790→                  style={{ minHeight: "400px" }}
+   791→   791→                />
+   792→   792→              </div>
+   793→   793→            </div>
+   794→   794→          </div>
+   795→   795→        )}
+   796→   796→      </main>
+   797→   797→
+   798→   798→      {/* Footer */}
+   799→   799→      <footer className="border-t border-border/50 py-4 mt-auto">
+   800→   800→        <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between text-xs text-muted-foreground">
+   801→   801→          <p>
+   802→   802→            SCS → STL Converter • HOOPS Communicator Engine
+   803→   803→          </p>
+   804→   804→          <p>100% client-side • No data uploaded</p>
+   805→   805→        </div>
+   806→   806→      </footer>
+   807→   807→    </div>
+   808→   808→  );
+   809→   809→}
+   810→   810→

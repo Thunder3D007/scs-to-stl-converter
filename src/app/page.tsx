@@ -186,6 +186,7 @@ export default function SCSConverter() {
   const viewerRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(false);
   const blobUrlRef = useRef<string | null>(null);
+  const fileRef = useRef<File | null>(null);
 
   const addLog = useCallback((msg: string, type: ConvertLog["type"] = "info") => {
     setLogs((prev) => [...prev, logMsg(msg, type)]);
@@ -202,7 +203,10 @@ export default function SCSConverter() {
   }, []);
 
   /* ─── mount viewer ─── */
-  const mountAndWait = useCallback(async () => {
+  const mountAndWait = useCallback(async (fileToMount?: File) => {
+    const f = fileToMount ?? fileRef.current;
+    if (!f) throw new Error("No file selected");
+
     const GcHoopsViewer = (window as Record<string, unknown>)
       .GcHoopsViewer as Record<string, unknown> | undefined;
     if (!GcHoopsViewer || typeof GcHoopsViewer.mountViewer !== "function") {
@@ -216,7 +220,7 @@ export default function SCSConverter() {
       mountedRef.current = false;
     }
     if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-    blobUrlRef.current = URL.createObjectURL(file!);
+    blobUrlRef.current = URL.createObjectURL(f);
 
     addLog("Loading 3D viewer...");
     (GcHoopsViewer.mountViewer as (
@@ -255,7 +259,7 @@ export default function SCSConverter() {
       "model geometry"
     );
     return model;
-  }, [file, addLog]);
+  }, [addLog]);
 
   /* ─── build STL ─── */
   const buildStl = useCallback(
@@ -414,13 +418,14 @@ export default function SCSConverter() {
         return;
       }
       setFile(f);
+      fileRef.current = f;
       setResult(null);
       setModelReady(false);
       setLogs([logMsg(`Selected: ${f.name} (${formatBytes(f.size)})`)]);
       setLoading(true);
 
       try {
-        const model = await mountAndWait();
+        const model = await mountAndWait(f);
         addLog("Model loaded — ready to convert", "success");
         setModelReady(true);
       } catch (e) {
