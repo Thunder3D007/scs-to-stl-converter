@@ -120,3 +120,18 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ── HOOPS Communicator: hide UI overlays in 3D preview ── */
+/* Primary hiding is done via JS (hideHoopsUI) but these CSS rules
+   provide immediate hiding before JS runs, and catch any missed elements. */
+
+/* The viewer container with data-hoops-viewer attribute */
+[data-hoops-viewer] {
+  position: relative !important;
+  overflow: hidden !important;
+}
+
+/* Common HOOPS UI class patterns — hide by default in our container */
+[data-hoops-viewer] > div:first-child:not(:has(canvas)) {
+  display: none !important;
+}

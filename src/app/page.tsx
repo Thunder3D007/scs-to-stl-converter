@@ -142,6 +142,67 @@ function modelHasGeometry(model: Record<string, unknown>): boolean {
   }
 }
 
+/**
+ * Hide all HOOPS Communicator UI overlay elements so only the 3D canvas
+ * remains visible. HOOPS renders measurement panels, views panel, toolbar,
+ * etc. as sibling divs alongside the canvas — these push the canvas down.
+ *
+ * Strategy: Walk the HOOPS DOM tree level by level. At each level, find the
+ * branch that contains the canvas (that's the 3D viewport) and hide all its
+ * siblings (those are the UI panels). Then make the canvas branch fill the
+ * entire container. Also installs a MutationObserver to catch late-loading UI.
+ */
+function hideHoopsUI(container: HTMLElement) {
+  function doHide() {
+    // Find the canvas — it's the deepest element we want to keep
+    const canvas = container.querySelector('canvas');
+    if (!canvas) return;
+
+    // Walk UP from canvas to container, at each level hiding siblings
+    // that don't contain the canvas (those are UI panels)
+    let current: HTMLElement | null = canvas.parentElement;
+    while (current && current !== container) {
+      // Make this element fill its parent
+      current.style.position = 'absolute';
+      current.style.top = '0';
+      current.style.left = '0';
+      current.style.width = '100%';
+      current.style.height = '100%';
+      current.style.overflow = 'hidden';
+
+      // Hide all siblings that don't contain the canvas
+      const parent = current.parentElement;
+      if (parent) {
+        for (const sibling of Array.from(parent.children)) {
+          if (sibling === current) continue;
+          if (sibling instanceof HTMLElement) {
+            sibling.style.display = 'none';
+          }
+        }
+      }
+
+      current = parent;
+    }
+
+    // Finally ensure the canvas itself fills its parent
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+  }
+
+  // Run immediately
+  doHide();
+
+  // Also re-run whenever HOOPS adds new DOM nodes (late-loading panels)
+  const observer = new MutationObserver(() => doHide());
+  observer.observe(container, { childList: true, subtree: true });
+
+  // Stop observing after 10 seconds (HOOPS UI should be fully loaded by then)
+  setTimeout(() => observer.disconnect(), 10000);
+}
+
 async function buildStl(
   model: Record<string, unknown>,
   flipZ: boolean,
@@ -410,6 +471,9 @@ export default function ScsToStlPage() {
       freshDiv.style.width = '100%';
       freshDiv.style.height = '100%';
       freshDiv.style.minHeight = '400px';
+      freshDiv.style.position = 'relative';
+      freshDiv.style.overflow = 'hidden';
+      freshDiv.setAttribute('data-hoops-viewer', 'true');
       viewerContainerRef.current?.appendChild(freshDiv);
 
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
@@ -451,6 +515,12 @@ export default function ScsToStlPage() {
         'model geometry',
       );
       addLog('Geometry streamed.', 'success');
+
+      // Hide all HOOPS UI overlay panels — only keep the canvas visible
+      // Small delay to let HOOPS finish rendering its full DOM tree
+      await sleep(500);
+      hideHoopsUI(freshDiv);
+
       return model;
     },
     [addLog],
